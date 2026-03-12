@@ -372,6 +372,7 @@ int main(int argc, char** argv) {
             "       %s --serve [port] [options]\n"
             "Options:\n"
             "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
+            "                      Auto-downloaded from GitHub on first run if missing\n"
             "  --voice <name>      Voice pack (default: af_heart)\n"
             "  -o <file>           Output WAV (default: output.wav, - for stdout)\n"
             "  --stdout            Write WAV to stdout\n"
@@ -415,6 +416,32 @@ int main(int argc, char** argv) {
     if (!serve_mode && text_input.empty()) {
         fprintf(stderr, "Error: --text is required (or use --serve for server mode)\n");
         return 1;
+    }
+
+    // --- Auto-download bundle if missing ---
+    {
+        struct stat st;
+        if (stat(bundle_path.c_str(), &st) != 0) {
+            // Create parent directories
+            std::string dir = bundle_path.substr(0, bundle_path.rfind('/'));
+            std::string mkdir_cmd = "mkdir -p " + dir;
+            if (system(mkdir_cmd.c_str()) != 0) {
+                fprintf(stderr, "Error: failed to create directory %s\n", dir.c_str());
+                return 1;
+            }
+
+            fprintf(stderr, "Bundle not found at %s — downloading...\n", bundle_path.c_str());
+            std::string curl_cmd =
+                "curl -L --progress-bar -o " + bundle_path +
+                " https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.bundle";
+            int ret = system(curl_cmd.c_str());
+            if (ret != 0) {
+                fprintf(stderr, "Error: download failed (exit code %d)\n", ret);
+                unlink(bundle_path.c_str()); // remove partial file
+                return 1;
+            }
+            fprintf(stderr, "Download complete.\n");
+        }
     }
 
     using clk = std::chrono::high_resolution_clock;
