@@ -289,7 +289,8 @@ struct TtsPipeline {
     cublasHandle_t cublas;
     cublasLtHandle_t ltHandle;
     cudaStream_t stream;
-    GpuArena& arena;
+    GpuArena& encode_arena;
+    GpuArena& decode_arena;
     float* d_workspace;
     size_t ws_bytes;
     VoiceMap& voices;
@@ -299,14 +300,15 @@ struct TtsPipeline {
     double last_g2p_ms = 0;
     double last_tts_ms = 0;
 
-    std::string synthesize(const std::string& text, const std::string& voice,
-                           std::vector<float>& audio_out) {
+    // Streaming synthesis: calls on_chunk(float_data, n_samples) per chunk.
+    // Returns "" on success, error string on failure.
+    template<typename F>
+    std::string synthesize_streaming(const std::string& text, const std::string& voice,
+                                      F on_chunk) {
         using clk = std::chrono::high_resolution_clock;
         auto ms = [](auto a, auto b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
-
-        audio_out.clear();
 
         // Preprocess
         auto t0 = clk::now();
@@ -325,10 +327,8 @@ struct TtsPipeline {
         if (ipa.empty())
             return "G2P produced no output";
 
-        // Chunk
         auto chunks = chunk_ipa(ipa);
 
-        // Voice lookup
         auto vit = voices.find(voice);
         if (vit == voices.end())
             return "unknown voice '" + voice + "'";
@@ -337,8 +337,8 @@ struct TtsPipeline {
         size_t voice_size = vit->second.end - vit->second.start;
         int voice_rows = voice_size / (256 * sizeof(float));
 
-        // TTS per chunk
         auto t_tts0 = clk::now();
+        size_t total_samples = 0;
         for (size_t c = 0; c < chunks.size(); c++) {
             auto& chunk = chunks[c];
             int T = (int)chunk.tokens.size();
@@ -348,21 +348,34 @@ struct TtsPipeline {
             if (phoneme_count >= voice_rows) phoneme_count = voice_rows - 1;
             const float* style = voice_data + phoneme_count * 256;
 
-            arena.reset();
             auto audio = rokoko_infer(weights, chunk.tokens.data(), T, style,
-                                       cublas, ltHandle, stream, arena,
-                                       d_workspace, ws_bytes);
-            audio_out.insert(audio_out.end(), audio.begin(), audio.end());
+                                       cublas, ltHandle, stream, encode_arena,
+                                       decode_arena, d_workspace, ws_bytes);
+            fprintf(stderr, "  chunk %zu: T=%d, %zu samples (%.2fs), decode arena=%.1f MB\n",
+                    c, T, audio.size(), audio.size()/24000.0, decode_arena.offset/1e6);
+            total_samples += audio.size();
+            if (!on_chunk(audio.data(), audio.size()))
+                return "";
         }
         auto t_tts1 = clk::now();
         last_tts_ms = ms(t_tts0, t_tts1);
 
-        double audio_sec = audio_out.size() / 24000.0;
+        double audio_sec = total_samples / 24000.0;
         double rtfx = audio_sec / (last_tts_ms / 1000.0);
         fprintf(stderr, "TTS: %.3f sec in %.1f ms (%.0fx realtime, %zu chunks)\n",
                 audio_sec, last_tts_ms, rtfx, chunks.size());
 
-        return ""; // success
+        return "";
+    }
+
+    std::string synthesize(const std::string& text, const std::string& voice,
+                           std::vector<float>& audio_out) {
+        audio_out.clear();
+        return synthesize_streaming(text, voice,
+            [&audio_out](const float* data, size_t n) -> bool {
+                audio_out.insert(audio_out.end(), data, data + n);
+                return true;
+            });
     }
 };
 
@@ -537,33 +550,29 @@ int main(int argc, char** argv) {
     // Server mode
     // =======================================================================
     if (serve_mode) {
-        // Pre-allocate arena + workspace once at max size
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        size_t arena_bytes = (size_t)(512 * 1024 * 1024);  // 512 MB
-        size_t ws_bytes = (size_t)(256 * 1024 * 1024);     // 256 MB
-        size_t budget = (size_t)(free_mem * 0.85);
-        if (arena_bytes + ws_bytes > budget) {
-            arena_bytes = (size_t)(budget * 0.67);
-            ws_bytes = budget - arena_bytes;
-        }
+        // Pre-allocate arenas + workspace
+        static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
+        static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
 
-        GpuArena arena;
-        arena.init(arena_bytes);
+        GpuArena encode_arena;
+        encode_arena.init(ENCODE_ARENA_BYTES);
+        GpuArena decode_arena;  // starts empty, grows on first use
+
         float* d_workspace;
-        CUDA_CHECK(cudaMalloc(&d_workspace, ws_bytes));
+        CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
 
-        fprintf(stderr, "Arena: %.0f MB | Workspace: %.0f MB\n",
-                arena_bytes / 1e6, ws_bytes / 1e6);
+        fprintf(stderr, "Encode arena: %.0f MB | Workspace: %.0f MB | Decode arena: on demand\n",
+                ENCODE_ARENA_BYTES / 1e6, WORKSPACE_BYTES / 1e6);
 
         TtsPipeline pipeline{prefetched, g2p, cublas, ltHandle, stream,
-                             arena, d_workspace, ws_bytes, voices};
+                             encode_arena, decode_arena, d_workspace, WORKSPACE_BYTES, voices};
 
         run_server(pipeline, serve_host, serve_port);
 
         // Cleanup (unreachable unless server stops)
         cudaFree(d_workspace);
-        arena.destroy();
+        decode_arena.destroy();
+        encode_arena.destroy();
         g2p.free();
         prefetched.free();
         cublasLtDestroy(ltHandle);
@@ -610,6 +619,16 @@ int main(int argc, char** argv) {
     // --- TTS infer per chunk ---
     std::vector<float> all_audio;
 
+    // Pre-allocate encode arena + workspace (shared across chunks)
+    static constexpr size_t ENCODE_ARENA_BYTES = 64 * 1024 * 1024;  // 64 MB
+    static constexpr size_t WORKSPACE_BYTES    = 128 * 1024 * 1024; // 128 MB
+
+    GpuArena encode_arena;
+    encode_arena.init(ENCODE_ARENA_BYTES);
+    GpuArena decode_arena;  // starts empty, grows on first use
+    float* d_workspace;
+    CUDA_CHECK(cudaMalloc(&d_workspace, WORKSPACE_BYTES));
+
     for (size_t c = 0; c < chunks.size(); c++) {
         auto& chunk = chunks[c];
         int T = (int)chunk.tokens.size();
@@ -622,38 +641,24 @@ int main(int argc, char** argv) {
         if (phoneme_count >= voice_rows) phoneme_count = voice_rows - 1;
         const float* style = voice_data + phoneme_count * 256;
 
-        // Allocate arena
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        size_t arena_bytes = std::max((size_t)(T * 5 * 1024 * 1024), (size_t)(256 * 1024 * 1024));
-        size_t ws_bytes = std::max((size_t)(T * 2 * 1024 * 1024), (size_t)(128 * 1024 * 1024));
-        size_t budget = (size_t)(free_mem * 0.7);
-        if (arena_bytes + ws_bytes > budget) {
-            arena_bytes = (size_t)(budget * 0.7);
-            ws_bytes = (size_t)(budget * 0.3);
-        }
-        GpuArena arena;
-        arena.init(arena_bytes);
-        float* d_workspace;
-        CUDA_CHECK(cudaMalloc(&d_workspace, ws_bytes));
-
         auto t0 = clk::now();
         auto audio = rokoko_infer(prefetched, chunk.tokens.data(), T, style,
-                                   cublas, ltHandle, stream, arena,
-                                   d_workspace, ws_bytes);
+                                   cublas, ltHandle, stream, encode_arena,
+                                   decode_arena, d_workspace, WORKSPACE_BYTES);
         auto t1 = clk::now();
 
         double gen_ms = ms(t0, t1);
         double audio_sec = audio.size() / 24000.0;
         double rtfx = audio_sec / (gen_ms / 1000.0);
-        fprintf(stderr, "  Generated %.3f sec in %.1f ms (%.0fx realtime)\n",
-                audio_sec, gen_ms, rtfx);
+        fprintf(stderr, "  Generated %.3f sec in %.1f ms (%.0fx realtime), decode arena=%.1f MB\n",
+                audio_sec, gen_ms, rtfx, decode_arena.offset/1e6);
 
         all_audio.insert(all_audio.end(), audio.begin(), audio.end());
-
-        cudaFree(d_workspace);
-        arena.destroy();
     }
+
+    cudaFree(d_workspace);
+    decode_arena.destroy();
+    encode_arena.destroy();
 
     // --- Write output ---
     write_wav(output_path, all_audio.data(), all_audio.size(), 24000);

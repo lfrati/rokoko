@@ -763,6 +763,87 @@ bool write_wav(const std::string& path, const float* audio, int n_samples,
 }
 
 // ---------------------------------------------------------------------------
+// Compute exact decode-arena bytes for given T (tokens) and L (duration frames)
+// Walks every arena.alloc() from the decode phase with 256-byte alignment.
+// ---------------------------------------------------------------------------
+
+size_t compute_decode_bytes(int T, int L) {
+    int L2 = 2 * L;
+    int T_audio = L2 * 300;
+    int har_frames = T_audio / 5 + 1;  // 60*L2 + 1
+
+    // Mimic GpuArena::alloc alignment: aligned = (off + 255) & ~255
+    auto a = [](size_t off, size_t bytes) -> size_t {
+        return ((off + 255) & ~(size_t)255) + bytes;
+    };
+
+    size_t off = 0;
+
+    // Workspace for gemm_conv1d/gemm_conv_transpose1d (first allocation).
+    // Max is generator resblocks: C=128, K=11, T=har_frames → 1408*har_frames floats.
+    size_t max_ws_floats = (size_t)128 * 11 * har_frames;
+    off = a(off, max_ws_floats * sizeof(float));
+
+    // Alignment matrix + expanded encoder + shared LSTM I/O
+    off = a(off, (size_t)T * L * sizeof(float));        // d_alignment
+    off = a(off, (size_t)640 * L * sizeof(float));       // d_en_expanded
+    off = a(off, (size_t)L * 640 * sizeof(float));       // d_shared_in
+    off = a(off, (size_t)L * 512 * sizeof(float));       // d_shared_out
+
+    // F0/N working buffers (shared across both chains)
+    off = a(off, (size_t)512 * L2 * sizeof(float));      // d_res_buf
+    off = a(off, (size_t)512 * L2 * sizeof(float));      // d_sc_buf
+    off = a(off, (size_t)1024 * sizeof(float));           // d_fc_buf
+
+    // F0/N predictions
+    off = a(off, (size_t)L2 * sizeof(float));             // d_f0_pred
+    off = a(off, (size_t)L2 * sizeof(float));             // d_n_pred
+
+    // Decoder inputs
+    off = a(off, (size_t)512 * L * sizeof(float));        // d_asr_aligned
+    off = a(off, (size_t)L * sizeof(float));              // d_f0_down
+    off = a(off, (size_t)L * sizeof(float));              // d_n_down
+    off = a(off, (size_t)514 * L * sizeof(float));        // d_dec_cat
+
+    // Decoder working buffers
+    int max_ch = 1090;
+    off = a(off, (size_t)max_ch * L2 * sizeof(float));   // d_dec_res
+    off = a(off, (size_t)max_ch * L2 * sizeof(float));   // d_dec_sc
+    off = a(off, (size_t)2 * max_ch * sizeof(float));    // d_dec_fc
+
+    // Decoder blocks
+    off = a(off, (size_t)1024 * L * sizeof(float));       // d_dec_out (encode block)
+    off = a(off, (size_t)64 * L * sizeof(float));         // d_asr_res
+    off = a(off, (size_t)1090 * L2 * sizeof(float));      // d_dec_in
+
+    // Decode blocks 0-2: 1024*L each; block 3: 512*L2 (has_upsample)
+    for (int i = 0; i < 3; i++)
+        off = a(off, (size_t)1024 * L * sizeof(float));
+    off = a(off, (size_t)512 * L2 * sizeof(float));
+
+    // Generator: SineGen intermediates (not save/restored)
+    off = a(off, (size_t)22 * har_frames * sizeof(float)); // d_gen_har
+    off = a(off, (size_t)L2 * 9 * sizeof(float));          // d_phase_low
+    off = a(off, (size_t)T_audio * sizeof(float));          // d_har_source
+    off = a(off, (size_t)9 * sizeof(float));                // d_rand_ini
+
+    // Generator working buffers (5 × 512 × har_frames — dominates total)
+    for (int i = 0; i < 5; i++)
+        off = a(off, (size_t)512 * har_frames * sizeof(float));
+    off = a(off, (size_t)512 * sizeof(float));              // d_gen_fc
+
+    // ResBlock averages: ups[0] → 256 × 10*L2, ups[1] → 128 × har_frames
+    int T_ups_0 = 10 * L2;  // (L2-1)*10 - 2*5 + 20 = 10*L2
+    off = a(off, (size_t)256 * T_ups_0 * sizeof(float));
+    off = a(off, (size_t)128 * har_frames * sizeof(float)); // = 128*(60*L2+1)
+
+    // Final audio buffer
+    off = a(off, (size_t)T_audio * sizeof(float));          // d_audio
+
+    return off;
+}
+
+// ---------------------------------------------------------------------------
 // Rokoko inference: phoneme IDs + style vector → audio
 // ---------------------------------------------------------------------------
 
@@ -773,6 +854,7 @@ std::vector<float> rokoko_infer(const Weights& w,
                                 cublasLtHandle_t ltHandle,
                                 cudaStream_t stream,
                                 GpuArena& arena,
+                                GpuArena& decode_arena,
                                 float* d_workspace,
                                 size_t workspace_bytes) {
     arena.reset();
@@ -876,75 +958,90 @@ std::vector<float> rokoko_infer(const Weights& w,
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int L2 = 2 * L;
 
+    // ===== DECODE PHASE: exact-sized arena =====
+    size_t decode_bytes = compute_decode_bytes(T, L);
+    if (decode_arena.capacity < decode_bytes) {
+        decode_arena.destroy();
+        decode_arena.init(decode_bytes);
+    } else {
+        decode_arena.reset();
+    }
+
+    // Decode workspace (first alloc, matches compute_decode_bytes order)
+    int har_frames_ws = (L2 * 300) / 5 + 1;
+    size_t dec_ws_floats = (size_t)128 * 11 * har_frames_ws;
+    float* d_dec_workspace = decode_arena.alloc<float>(dec_ws_floats);
+    size_t dec_ws_bytes = dec_ws_floats * sizeof(float);
+
     // Build alignment matrix on GPU
-    float* d_alignment = arena.alloc<float>(T * L);
+    float* d_alignment = decode_arena.alloc<float>(T * L);
     build_alignment_f32(d_int_durations, d_alignment, T, L, stream);
 
     // Expand encoder output: [640, T] @ [T, L] → [640, L]
-    float* d_en_expanded = arena.alloc<float>(640 * L);
+    float* d_en_expanded = decode_arena.alloc<float>(640 * L);
     sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, L, 640, T,
           d_alignment, L, d_cat_buf, T, d_en_expanded, L);
 
     // Shared LSTM: [640, L] → [L, 640] → BiLSTM → [L, 512]
-    float* d_shared_in = arena.alloc<float>(L * 640);
+    float* d_shared_in = decode_arena.alloc<float>(L * 640);
     transpose_f32(d_en_expanded, d_shared_in, 640, L, stream);
-    float* d_shared_out = arena.alloc<float>(L * 512);
+    float* d_shared_out = decode_arena.alloc<float>(L * 512);
     bilstm_gpu(d_shared_in, d_shared_out, w.shared_lstm,
-               L, 640, 256, cublas, stream, arena);
+               L, 640, 256, cublas, stream, decode_arena);
 
     // F0 and N prediction chains
     // Both: [L, 512] → [512, L] → 3 AdainResBlk1d → Conv1d proj → [1, 2L]
-    float* d_res_buf = arena.alloc<float>(512 * L2);
-    float* d_sc_buf  = arena.alloc<float>(512 * L2);
-    float* d_fc_buf  = arena.alloc<float>(1024);
+    float* d_res_buf = decode_arena.alloc<float>(512 * L2);
+    float* d_sc_buf  = decode_arena.alloc<float>(512 * L2);
+    float* d_fc_buf  = decode_arena.alloc<float>(1024);
 
     auto run_f0n_chain = [&](const Weights::AdainResBlk1dWeights blocks[3],
                               const float* proj_w, const float* proj_b,
                               float* d_pred) {
-        size_t chain_save = arena.save();
-        float* d_fx = arena.alloc<float>(512 * L2);
-        float* d_fo = arena.alloc<float>(512 * L2);
+        size_t chain_save = decode_arena.save();
+        float* d_fx = decode_arena.alloc<float>(512 * L2);
+        float* d_fo = decode_arena.alloc<float>(512 * L2);
         transpose_f32(d_shared_out, d_fx, L, 512, stream);
 
         // block 0: [512, L] → [512, L]
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[0],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 512, L, 128, cublas, stream,
-                                d_workspace, workspace_bytes);
+                                d_dec_workspace, dec_ws_bytes);
         // block 1: [512, L] → [256, 2L] (upsample)
         cudaMemcpyAsync(d_fx, d_fo, 512 * L * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[1],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 256, L, 128, cublas, stream,
-                                d_workspace, workspace_bytes);
+                                d_dec_workspace, dec_ws_bytes);
         // block 2: [256, 2L] → [256, 2L]
         cudaMemcpyAsync(d_fx, d_fo, 256 * L2 * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[2],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 256, 256, L2, 128, cublas, stream,
-                                d_workspace, workspace_bytes);
+                                d_dec_workspace, dec_ws_bytes);
         // Projection: Conv1d(256→1, k=1)
         conv1d_f32(d_fo, proj_w, proj_b, d_pred, 256, 1, L2, 1, stream);
-        arena.restore(chain_save);
+        decode_arena.restore(chain_save);
     };
 
-    float* d_f0_pred = arena.alloc<float>(L2);
-    float* d_n_pred  = arena.alloc<float>(L2);
+    float* d_f0_pred = decode_arena.alloc<float>(L2);
+    float* d_n_pred  = decode_arena.alloc<float>(L2);
     run_f0n_chain(w.f0_blocks, w.f0_proj_w, w.f0_proj_b, d_f0_pred);
     run_f0n_chain(w.n_blocks, w.n_proj_w, w.n_proj_b, d_n_pred);
 
     // ---- Decoder ----
     // Build asr_aligned: text encoder [512, T] expanded by durations → [512, L]
     // Use the alignment matrix already on GPU: asr_aligned = emb @ alignment
-    float* d_asr_aligned = arena.alloc<float>(512 * L);
+    float* d_asr_aligned = decode_arena.alloc<float>(512 * L);
     sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, L, 512, T,
           d_alignment, L, te_buf.emb, T, d_asr_aligned, L);
 
     // F0/N downsampling: Conv1d(1,1,k=3,s=2,p=1) on [1, 2L] → [1, L]
-    float* d_f0_down = arena.alloc<float>(L);
-    float* d_n_down  = arena.alloc<float>(L);
+    float* d_f0_down = decode_arena.alloc<float>(L);
+    float* d_n_down  = decode_arena.alloc<float>(L);
 
     // F0/N downsample — wv has precomputed weight
     conv1d_general_f32(d_f0_pred, w.dec_f0_conv_wv, w.dec_f0_conv_b,
@@ -953,7 +1050,7 @@ std::vector<float> rokoko_infer(const Weights& w,
                        d_n_down, 1, 1, L2, 3, 2, 1, 1, stream);
 
     // Concatenate [asr_aligned, F0_down, N_down] → [514, L]
-    float* d_dec_cat = arena.alloc<float>(514 * L);
+    float* d_dec_cat = decode_arena.alloc<float>(514 * L);
     cudaMemcpyAsync(d_dec_cat, d_asr_aligned, 512 * L * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyAsync(d_dec_cat + 512 * L, d_f0_down, L * sizeof(float),
@@ -963,25 +1060,25 @@ std::vector<float> rokoko_infer(const Weights& w,
 
     // Decoder working buffers
     int max_ch = 1090;
-    float* d_dec_res = arena.alloc<float>(max_ch * L2);
-    float* d_dec_sc  = arena.alloc<float>(max_ch * L2);
-    float* d_dec_fc  = arena.alloc<float>(2 * max_ch);
+    float* d_dec_res = decode_arena.alloc<float>(max_ch * L2);
+    float* d_dec_sc  = decode_arena.alloc<float>(max_ch * L2);
+    float* d_dec_fc  = decode_arena.alloc<float>(2 * max_ch);
 
     // Encode: AdainResBlk1d(514→1024)
-    float* d_dec_out = arena.alloc<float>(1024 * L);
+    float* d_dec_out = decode_arena.alloc<float>(1024 * L);
     adain_resblk1d_forward(d_dec_cat, d_style_acoustic, w.dec_encode,
                             d_dec_res, d_dec_sc, d_dec_fc, d_dec_out,
                             514, 1024, L, 128, cublas, stream,
-                            d_workspace, workspace_bytes);
+                            d_dec_workspace, dec_ws_bytes);
 
     // asr_res: Conv1d(512→64, k=1) — wv has precomputed weight
-    float* d_asr_res = arena.alloc<float>(64 * L);
+    float* d_asr_res = decode_arena.alloc<float>(64 * L);
     conv1d_f32(d_asr_aligned, w.dec_asr_res_wv, w.dec_asr_res_b, d_asr_res,
                512, 64, L, 1, stream);
 
     // Decode blocks [0-3] with skip connections
     float* d_dec_x = d_dec_out;
-    float* d_dec_in = arena.alloc<float>(1090 * L2);
+    float* d_dec_in = decode_arena.alloc<float>(1090 * L2);
 
     int dim_in_sizes[] = {1090, 1090, 1090, 1090};
     int dim_out_sizes[] = {1024, 1024, 1024, 512};
@@ -1005,12 +1102,12 @@ std::vector<float> rokoko_infer(const Weights& w,
         }
 
         int T_blk_out = w.dec_decode[bi].has_upsample ? 2 * T_blk : T_blk;
-        float* d_blk_out = arena.alloc<float>(dim_out_sizes[bi] * T_blk_out);
+        float* d_blk_out = decode_arena.alloc<float>(dim_out_sizes[bi] * T_blk_out);
         adain_resblk1d_forward(d_dec_in, d_style_acoustic, w.dec_decode[bi],
                                 d_dec_res, d_dec_sc, d_dec_fc, d_blk_out,
                                 dim_in_sizes[bi], dim_out_sizes[bi], T_blk,
                                 128, cublas, stream,
-                                d_workspace, workspace_bytes);
+                                d_dec_workspace, dec_ws_bytes);
 
         d_dec_x = d_blk_out;
 
@@ -1027,11 +1124,11 @@ std::vector<float> rokoko_infer(const Weights& w,
     int n_fft_gen = 20, hop_gen = 5;
     int har_frames = T_audio / hop_gen + 1;
 
-    float* d_gen_har = arena.alloc<float>(22 * har_frames);
+    float* d_gen_har = decode_arena.alloc<float>(22 * har_frames);
     {
         // GPU SineGen: F0 → harmonic source (no CPU sync, no memcpy)
-        float* d_phase_low = arena.alloc<float>(L2 * 9);
-        float* d_har_source = arena.alloc<float>(T_audio);
+        float* d_phase_low = decode_arena.alloc<float>(L2 * 9);
+        float* d_har_source = decode_arena.alloc<float>(T_audio);
 
         // Upload random initial phases (fundamental=0, overtones=random)
         float rand_ini[9];
@@ -1039,7 +1136,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> uni(0.0f, 1.0f);
         for (int h = 1; h < 9; h++) rand_ini[h] = uni(rng);
-        float* d_rand_ini = arena.alloc<float>(9);
+        float* d_rand_ini = decode_arena.alloc<float>(9);
         cudaMemcpyAsync(d_rand_ini, rand_ini, 9 * sizeof(float),
                         cudaMemcpyHostToDevice, stream);
 
@@ -1059,12 +1156,12 @@ std::vector<float> rokoko_infer(const Weights& w,
     // Generator working buffers
     int max_gen_T = har_frames;
     int max_gen_C = 512;
-    float* d_gen_x   = arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_xt  = arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_co  = arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_fc  = arena.alloc<float>(512);
-    float* d_gen_src = arena.alloc<float>(max_gen_C * max_gen_T);
-    float* d_gen_tmp = arena.alloc<float>(max_gen_C * max_gen_T);
+    float* d_gen_x   = decode_arena.alloc<float>(max_gen_C * max_gen_T);
+    float* d_gen_xt  = decode_arena.alloc<float>(max_gen_C * max_gen_T);
+    float* d_gen_co  = decode_arena.alloc<float>(max_gen_C * max_gen_T);
+    float* d_gen_fc  = decode_arena.alloc<float>(512);
+    float* d_gen_src = decode_arena.alloc<float>(max_gen_C * max_gen_T);
+    float* d_gen_tmp = decode_arena.alloc<float>(max_gen_C * max_gen_T);
 
     // Copy generator input
     int T_gen = L2;
@@ -1089,12 +1186,12 @@ std::vector<float> rokoko_infer(const Weights& w,
         if (i == 0) {
             gemm_conv1d(cublas, d_gen_har, w.gen_noise_convs[i].w,
                          w.gen_noise_convs[i].b, d_gen_src,
-                         d_workspace, workspace_bytes,
+                         d_dec_workspace, dec_ws_bytes,
                          22, C_out, har_frames, 12, 6, 3, 1, stream);
         } else {
             gemm_conv1d(cublas, d_gen_har, w.gen_noise_convs[i].w,
                          w.gen_noise_convs[i].b, d_gen_src,
-                         d_workspace, workspace_bytes,
+                         d_dec_workspace, dec_ws_bytes,
                          22, C_out, har_frames, 1, 1, 0, 1, stream);
         }
 
@@ -1103,12 +1200,12 @@ std::vector<float> rokoko_infer(const Weights& w,
         adain_resblock1_forward(d_gen_src, d_style_acoustic, w.gen_noise_res[i],
                                 d_gen_xt, d_gen_co, d_gen_fc,
                                 src_T, 128, cublas, stream,
-                                d_workspace, workspace_bytes);
+                                d_dec_workspace, dec_ws_bytes);
 
         // ups[i]: ConvTranspose1d — wv has precomputed weight
         int T_ups = (T_loop - 1) * us - 2 * up + uk;
         gemm_conv_transpose1d(cublas, d_gen_x, w.gen_ups[i].wv, w.gen_ups[i].b,
-                               d_gen_tmp, d_workspace, workspace_bytes,
+                               d_gen_tmp, d_dec_workspace, dec_ws_bytes,
                                C_in, C_out, T_loop, uk, us, up, 0, stream);
 
         // Reflection pad on last upsample
@@ -1124,7 +1221,7 @@ std::vector<float> rokoko_infer(const Weights& w,
         add_f32(d_gen_x, d_gen_src, d_gen_x, C_out * T_ups, stream);
 
         // ResBlocks: 3 blocks, average outputs
-        float* d_rb_avg = arena.alloc<float>(C_out * T_ups);
+        float* d_rb_avg = decode_arena.alloc<float>(C_out * T_ups);
         CUDA_CHECK(cudaMemsetAsync(d_rb_avg, 0, C_out * T_ups * sizeof(float), stream));
 
         for (int j = 0; j < 3; j++) {
@@ -1134,7 +1231,7 @@ std::vector<float> rokoko_infer(const Weights& w,
             adain_resblock1_forward(d_gen_tmp, d_style_acoustic, w.gen_resblocks[rb_idx],
                                     d_gen_xt, d_gen_co, d_gen_fc,
                                     T_ups, 128, cublas, stream,
-                                    d_workspace, workspace_bytes);
+                                    d_dec_workspace, dec_ws_bytes);
             add_f32(d_rb_avg, d_gen_tmp, d_rb_avg, C_out * T_ups, stream);
         }
         scale_f32(d_rb_avg, d_gen_x, C_out * T_ups, 1.0f / 3.0f, stream);
@@ -1146,7 +1243,7 @@ std::vector<float> rokoko_infer(const Weights& w,
     // Post: LeakyReLU(0.01) + conv_post(128→22, k=7) — wv has precomputed weight
     leaky_relu_f32(d_gen_x, d_gen_x, 128 * T_loop, 0.01f, stream);
     gemm_conv1d(cublas, d_gen_x, w.gen_conv_post_wv, w.gen_conv_post_b, d_gen_tmp,
-                 d_workspace, workspace_bytes, 128, 22, T_loop, 7, 1, 3, 1, stream);
+                 d_dec_workspace, dec_ws_bytes, 128, 22, T_loop, 7, 1, 3, 1, stream);
 
     // spec = exp(x[:11,:]), phase = sin(x[11:,:])
     int n_freqs = 11;
@@ -1155,7 +1252,7 @@ std::vector<float> rokoko_infer(const Weights& w,
             n_freqs * T_loop, stream);
 
     // iSTFT → audio
-    float* d_audio = arena.alloc<float>(T_audio);
+    float* d_audio = decode_arena.alloc<float>(T_audio);
     istft_f32(d_gen_x, d_gen_x + n_freqs * T_loop, d_audio,
               T_loop, 20, 5, T_audio, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1165,7 +1262,6 @@ std::vector<float> rokoko_infer(const Weights& w,
     cudaMemcpy(audio.data(), d_audio, T_audio * sizeof(float),
                cudaMemcpyDeviceToHost);
 
-    // Arena reset happens at next call — no cleanup needed
     return audio;
 }
 

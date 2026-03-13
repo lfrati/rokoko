@@ -372,11 +372,14 @@ struct Weights {
 // Inference API (defined in tts.cpp)
 // ---------------------------------------------------------------------------
 
+/// Compute exact decode-arena bytes needed for given T (tokens) and L (frames).
+size_t compute_decode_bytes(int T, int L);
+
 /// Run Kokoro inference: phoneme token IDs + style vector → audio samples.
 std::vector<float> rokoko_infer(const Weights& w,
     const int* token_ids, int T, const float* style_vec,
     cublasHandle_t cublas, cublasLtHandle_t ltHandle,
-    cudaStream_t stream, GpuArena& arena,
+    cudaStream_t stream, GpuArena& arena, GpuArena& decode_arena,
     float* d_workspace, size_t workspace_bytes);
 
 /// Write audio samples to a WAV file (16-bit PCM). path="-" writes to stdout.

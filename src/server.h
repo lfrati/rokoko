@@ -145,46 +145,84 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
 </div>
 <script>
 const $ = id => document.getElementById(id);
+let curCtx = null;
 async function speak() {
   const text = $('text').value.trim();
   if (!text) return;
   $('btn').disabled = true;
   $('status').textContent = 'generating...';
   $('timing').textContent = '';
+  $('audio').style.display = 'none';
+  if (curCtx) { curCtx.close(); curCtx = null; }
   const t0 = performance.now();
+  let tfirst = 0;
   try {
-    const res = await fetch('/synthesize', {
+    const r = await fetch('/synthesize/stream', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({text, voice: $('voice').value})
     });
-    if (!res.ok) {
-      const err = await res.json();
-      $('status').textContent = err.error || 'error';
+    if (!r.ok) {
+      $('status').textContent = (await r.json()).error || 'error';
       return;
     }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const audio = $('audio');
-    audio.src = url;
-    audio.style.display = 'block';
-    audio.play();
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-    const dur = res.headers.get('X-Audio-Duration');
-    const g2p = res.headers.get('X-G2P-Ms');
-    const tts = res.headers.get('X-TTS-Ms');
+    const ctx = new AudioContext({sampleRate: 24000});
+    curCtx = ctx;
+    let nt = 0, ns = 0;
+    const pcm = [];
+    let rem = new Uint8Array(0);
+    const rd = r.body.getReader();
+    for (;;) {
+      const {done, value} = await rd.read();
+      if (done) break;
+      if (!tfirst) {
+        tfirst = performance.now();
+        $('status').textContent = 'streaming...';
+        nt = ctx.currentTime + 0.05;
+      }
+      const c = new Uint8Array(rem.length + value.length);
+      c.set(rem); c.set(value, rem.length);
+      const u = c.length - c.length % 4;
+      rem = u < c.length ? c.slice(u) : new Uint8Array(0);
+      if (!u) continue;
+      const ab = new ArrayBuffer(u);
+      new Uint8Array(ab).set(c.subarray(0, u));
+      const f = new Float32Array(ab);
+      pcm.push(f); ns += f.length;
+      const b = ctx.createBuffer(1, f.length, 24000);
+      b.getChannelData(0).set(f);
+      const s = ctx.createBufferSource();
+      s.buffer = b; s.connect(ctx.destination);
+      if (nt < ctx.currentTime) nt = ctx.currentTime;
+      s.start(nt); nt += b.duration;
+    }
+    if (!ns) { $('status').textContent = 'no audio'; return; }
+    $('audio').src = URL.createObjectURL(makeWav(pcm, ns));
+    $('audio').style.display = 'block';
     $('status').textContent = '';
-    const parts = [];
-    if (dur) parts.push(parseFloat(dur).toFixed(1) + 's audio');
-    if (g2p) parts.push('g2p ' + parseFloat(g2p).toFixed(0) + 'ms');
-    if (tts) parts.push('tts ' + parseFloat(tts).toFixed(0) + 'ms');
-    parts.push('total ' + elapsed + 's');
-    $('timing').textContent = parts.join('  ·  ');
+    const dur = (ns / 24000).toFixed(1);
+    const first = tfirst ? (tfirst - t0).toFixed(0) : '?';
+    const total = ((performance.now() - t0) / 1000).toFixed(2);
+    $('timing').textContent = dur + 's audio  \u00b7  first chunk ' + first + 'ms  \u00b7  total ' + total + 's';
   } catch(e) {
-    $('status').textContent = 'network error';
+    $('status').textContent = 'error';
   } finally {
     $('btn').disabled = false;
   }
+}
+function makeWav(chunks, n) {
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8,'WAVE');
+  w(12,'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 24000, true); v.setUint32(28, 48000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36,'data'); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const c of chunks) for (let i = 0; i < c.length; i++) {
+    const x = Math.max(-1, Math.min(1, c[i]));
+    v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7FFF, true); o += 2;
+  }
+  return new Blob([buf], {type: 'audio/wav'});
 }
 $('text').addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); speak(); }
@@ -243,6 +281,53 @@ $('text').addEventListener('keydown', e => {
         snprintf(detail, sizeof(detail), "audio=%.1fs  inference=%.0fms  RTFx=%.0fx  \"%s\"",
                  audio_dur, elapsed_ms, rtfx, preview.c_str());
         t_log_detail = detail;
+    });
+
+    // Streaming endpoint: sends raw float32 PCM via chunked transfer encoding.
+    // Each TTS chunk is flushed as it's synthesized, enabling low-latency playback.
+    svr.Post("/synthesize/stream", [&](const httplib::Request& req, httplib::Response& res) {
+        std::string text = json_get_string(req.body, "text");
+        std::string voice = json_get_string(req.body, "voice", "af_heart");
+
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing 'text' field\"}", "application/json");
+            return;
+        }
+
+        res.set_header("X-Sample-Rate", std::to_string(SAMPLE_RATE));
+
+        res.set_chunked_content_provider(
+            "audio/pcm",
+            [&pipeline, &mtx, text, voice](size_t /*offset*/, httplib::DataSink& sink) {
+                std::lock_guard<std::mutex> lock(mtx);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                size_t total_samples = 0;
+
+                pipeline.synthesize_streaming(text, voice,
+                    [&sink, &total_samples](const float* data, size_t n) -> bool {
+                        total_samples += n;
+                        return sink.write(reinterpret_cast<const char*>(data),
+                                          n * sizeof(float));
+                    });
+
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                double audio_dur = (double)total_samples / SAMPLE_RATE;
+                double rtfx = (elapsed_ms > 0) ? audio_dur / (elapsed_ms / 1000.0) : 0;
+
+                std::string preview = text.substr(0, 80);
+                if (text.size() > 80) preview += "...";
+                char detail[256];
+                snprintf(detail, sizeof(detail),
+                         "[stream] audio=%.1fs  inference=%.0fms  RTFx=%.0fx  \"%s\"",
+                         audio_dur, elapsed_ms, rtfx, preview.c_str());
+                t_log_detail = detail;
+
+                sink.done();
+                return true;
+            }
+        );
     });
 
     const char* display_host = (host == "0.0.0.0") ? "localhost" : host.c_str();
