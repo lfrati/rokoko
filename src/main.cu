@@ -373,18 +373,23 @@ struct TtsPipeline {
 int main(int argc, char** argv) {
     auto print_usage = [&]() {
         fprintf(stderr,
-            "Usage: %s --text <text> [options]\n"
+            "Usage: %s <text> [options]\n"
             "       %s --serve [port] [options]\n"
+            "\n"
             "Options:\n"
-            "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
-            "                      Auto-downloaded from GitHub on first run if missing\n"
-            "  --voice <name>      Voice pack (default: af_heart)\n"
-            "  -o <file>           Output WAV (default: output.wav, - for stdout)\n"
+            "  --voice <name>      Voice (default: af_heart)\n"
+            "  -o <file>           Output WAV (default: output.wav)\n"
             "  --stdout            Write WAV to stdout\n"
-            "  --serve [port]      Start HTTP server (default port: 8080)\n"
+            "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
-            "  --help              Show this help\n",
-            argv[0], argv[0]);
+            "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
+            "  --help              Show this help\n"
+            "\n"
+            "Examples:\n"
+            "  %s \"Hello world.\" -o hello.wav\n"
+            "  %s \"Hello world.\" --stdout | aplay\n"
+            "  %s --serve 8080\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
     };
 
     if (argc < 2) { print_usage(); return 1; }
@@ -406,21 +411,27 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--text" && i + 1 < argc)        text_input = argv[++i];
-        else if (arg == "--bundle" && i + 1 < argc)  bundle_path = argv[++i];
-        else if (arg == "--voice" && i + 1 < argc)  voice_name = argv[++i];
-        else if (arg == "-o" && i + 1 < argc)       output_path = argv[++i];
-        else if (arg == "--stdout")                  output_path = "-";
-        else if (arg == "--host" && i + 1 < argc)   serve_host = argv[++i];
+        if (arg == "--bundle" && i + 1 < argc)       bundle_path = argv[++i];
+        else if (arg == "--voice" && i + 1 < argc)   voice_name = argv[++i];
+        else if (arg == "-o" && i + 1 < argc)        output_path = argv[++i];
+        else if (arg == "--stdout")                   output_path = "-";
+        else if (arg == "--host" && i + 1 < argc)    serve_host = argv[++i];
         else if (arg == "--serve") {
             serve_mode = true;
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
                 serve_port = std::atoi(argv[++i]);
         }
+        else if (arg[0] != '-') {
+            if (!text_input.empty()) {
+                fprintf(stderr, "Error: unexpected argument '%s' (text already set)\n", arg.c_str());
+                return 1;
+            }
+            text_input = arg;
+        }
     }
 
     if (!serve_mode && text_input.empty()) {
-        fprintf(stderr, "Error: --text is required (or use --serve for server mode)\n");
+        fprintf(stderr, "Error: provide text or use --serve for server mode\n");
         return 1;
     }
 
@@ -448,7 +459,7 @@ int main(int argc, char** argv) {
             std::string tmp_path = bundle_path + ".tmp";
             pid_t pid = fork();
             if (pid == 0) {
-                execlp("curl", "curl", "-L", "--progress-bar", "-o", tmp_path.c_str(), url, nullptr);
+                execlp("curl", "curl", "-L", "-#", "-o", tmp_path.c_str(), url, nullptr);
                 _exit(127);
             }
             int status;

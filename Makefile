@@ -1,3 +1,4 @@
+MAKEFLAGS += -j$(shell nproc)
 CUDA_HOME ?= /usr/local/cuda-13.1
 
 CXX      = g++
