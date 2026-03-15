@@ -293,7 +293,8 @@ void transpose_f32(const float* x, float* y, int M, int N,
 }
 
 // ---------------------------------------------------------------------------
-// Conv1d: y[c_out, t] = sum_{c_in, k} w[c_out, c_in, k] * x[c_in, t+k-pad] + b[c_out]
+// Conv1d: y[t, c_out] = sum_{c_in, k} w[c_out, c_in, k] * x[t+k-pad, c_in] + b[c_out]
+//   x: [T, C_in], y: [T, C_out], w: [C_out, C_in, K]
 //   One thread block per (c_out, t) pair. Simple implementation for small T.
 // ---------------------------------------------------------------------------
 
@@ -312,7 +313,7 @@ __global__ void conv1d_kernel(const float* x, const float* w, const float* bias,
         int k = idx % K;
         int t_in = t + k - pad;
         if (t_in >= 0 && t_in < T) {
-            sum += w[co * C_in * K + ci * K + k] * x[ci * T + t_in];
+            sum += w[co * C_in * K + ci * K + k] * x[t_in * C_in + ci];
         }
     }
 
@@ -321,7 +322,7 @@ __global__ void conv1d_kernel(const float* x, const float* w, const float* bias,
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
 
     if (threadIdx.x == 0) {
-        y[co * T + t] = sum + (bias ? bias[co] : 0.0f);
+        y[t * C_out + co] = sum + (bias ? bias[co] : 0.0f);
     }
 }
 
@@ -370,7 +371,7 @@ void weight_norm_f32(const float* wg, const float* wv, float* w,
 }
 
 // ---------------------------------------------------------------------------
-// Channels-first LayerNorm: x[C, T] -> y[C, T]
+// LayerNorm across channels: x[T, C] -> y[T, C]
 //   For each t: normalize across the C dimension.
 //   One warp per time position.
 // ---------------------------------------------------------------------------
@@ -381,10 +382,13 @@ __global__ void layer_norm_cf_kernel(const float* x, const float* gamma,
     int t = blockIdx.x;
     if (t >= T) return;
 
+    const float* x_row = x + t * C;
+    float* y_row = y + t * C;
+
     // Compute mean across channels at position t
     float sum = 0.0f;
     for (int c = threadIdx.x; c < C; c += 32) {
-        sum += x[c * T + t];
+        sum += x_row[c];
     }
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
@@ -393,7 +397,7 @@ __global__ void layer_norm_cf_kernel(const float* x, const float* gamma,
     // Compute variance
     float var_sum = 0.0f;
     for (int c = threadIdx.x; c < C; c += 32) {
-        float diff = x[c * T + t] - mean;
+        float diff = x_row[c] - mean;
         var_sum += diff * diff;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -402,8 +406,8 @@ __global__ void layer_norm_cf_kernel(const float* x, const float* gamma,
 
     // Normalize
     for (int c = threadIdx.x; c < C; c += 32) {
-        float val = (x[c * T + t] - mean) * inv_std;
-        y[c * T + t] = val * gamma[c] + beta[c];
+        float val = (x_row[c] - mean) * inv_std;
+        y_row[c] = val * gamma[c] + beta[c];
     }
 }
 
@@ -432,9 +436,9 @@ void cast_i64_to_i32(const int64_t* src, int* dst, int N,
 
 // ---------------------------------------------------------------------------
 // Instance Normalization 1D: normalize each channel across time
-//   x, y: [C, T], weight, bias: [C]
-//   For each c: y[c, t] = weight[c] * (x[c,t] - mean_c) / sqrt(var_c + eps) + bias[c]
-//   One warp per channel.
+//   x, y: [T, C], weight, bias: [C]
+//   For each c: y[t,c] = weight[c] * (x[t,c] - mean_c) / sqrt(var_c + eps) + bias[c]
+//   One warp per channel. Data is strided by C.
 // ---------------------------------------------------------------------------
 
 __global__ void instance_norm_1d_kernel(const float* x, const float* weight,
@@ -443,13 +447,10 @@ __global__ void instance_norm_1d_kernel(const float* x, const float* weight,
     int c = blockIdx.x;
     if (c >= C) return;
 
-    const float* x_row = x + c * T;
-    float* y_row = y + c * T;
-
-    // Mean across T
+    // Mean across T (strided access: x[t*C+c])
     float sum = 0.0f;
     for (int t = threadIdx.x; t < T; t += 32)
-        sum += x_row[t];
+        sum += x[t * C + c];
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
     float mean = __shfl_sync(0xFFFFFFFF, sum, 0) / T;
@@ -457,7 +458,7 @@ __global__ void instance_norm_1d_kernel(const float* x, const float* weight,
     // Variance across T
     float var_sum = 0.0f;
     for (int t = threadIdx.x; t < T; t += 32) {
-        float diff = x_row[t] - mean;
+        float diff = x[t * C + c] - mean;
         var_sum += diff * diff;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -467,7 +468,7 @@ __global__ void instance_norm_1d_kernel(const float* x, const float* weight,
     // Normalize with per-channel affine
     float w = weight[c], b = bias[c];
     for (int t = threadIdx.x; t < T; t += 32) {
-        y_row[t] = w * (x_row[t] - mean) * inv_std + b;
+        y[t * C + c] = w * (x[t * C + c] - mean) * inv_std + b;
     }
 }
 
@@ -478,8 +479,8 @@ void instance_norm_1d_f32(const float* x, const float* weight, const float* bias
 }
 
 // ---------------------------------------------------------------------------
-// Style affine 1D: y[c,t] = (1 + gamma[c]) * x[c,t] + beta[c]
-//   x, y: [C, T], gamma, beta: [C]
+// Style affine 1D: y[t,c] = (1 + gamma[c]) * x[t,c] + beta[c]
+//   x, y: [T, C], gamma, beta: [C]
 // ---------------------------------------------------------------------------
 
 __global__ void style_affine_1d_kernel(const float* x, const float* gamma,
@@ -488,7 +489,7 @@ __global__ void style_affine_1d_kernel(const float* x, const float* gamma,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = C * T;
     if (idx < total) {
-        int c = idx / T;
+        int c = idx % C;
         y[idx] = (1.0f + gamma[c]) * x[idx] + beta[c];
     }
 }
@@ -503,8 +504,8 @@ void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
 
 // ---------------------------------------------------------------------------
 // Fused InstanceNorm + StyleAffine: single-pass AdaIN
-//   y[c,t] = (1+gamma[c]) * (norm_w[c] * (x[c,t]-mean)/sqrt(var+eps) + norm_b[c]) + beta[c]
-//   One block per channel, 32 threads (warp). Eliminates separate instance_norm + style_affine.
+//   y[t,c] = (1+gamma[c]) * (norm_w[c] * (x[t,c]-mean)/sqrt(var+eps) + norm_b[c]) + beta[c]
+//   x, y: [T, C]. One block per channel, 32 threads (warp). Strided access by C.
 // ---------------------------------------------------------------------------
 
 __global__ void instance_norm_style_affine_kernel(
@@ -514,13 +515,10 @@ __global__ void instance_norm_style_affine_kernel(
     int c = blockIdx.x;
     if (c >= C) return;
 
-    const float* x_row = x + c * T;
-    float* y_row = y + c * T;
-
-    // Mean across T
+    // Mean across T (strided)
     float sum = 0.0f;
     for (int t = threadIdx.x; t < T; t += 32)
-        sum += x_row[t];
+        sum += x[t * C + c];
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
     float mean = __shfl_sync(0xFFFFFFFF, sum, 0) / T;
@@ -528,7 +526,7 @@ __global__ void instance_norm_style_affine_kernel(
     // Variance across T
     float var_sum = 0.0f;
     for (int t = threadIdx.x; t < T; t += 32) {
-        float diff = x_row[t] - mean;
+        float diff = x[t * C + c] - mean;
         var_sum += diff * diff;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -541,7 +539,7 @@ __global__ void instance_norm_style_affine_kernel(
     float combined_bias = g * (norm_b[c] - norm_w[c] * mean * inv_std) + beta[c];
 
     for (int t = threadIdx.x; t < T; t += 32) {
-        y_row[t] = combined_scale * x_row[t] + combined_bias;
+        y[t * C + c] = combined_scale * x[t * C + c] + combined_bias;
     }
 }
 
@@ -600,7 +598,7 @@ void ada_layer_norm_f32(const float* x, const float* gamma, const float* beta,
 
 // ---------------------------------------------------------------------------
 // Depthwise transposed Conv1d
-//   x: [C, T_in], w: [C, 1, K], bias: [C], y: [C, T_out]
+//   x: [T_in, C], w: [C, 1, K], bias: [C], y: [T_out, C]
 //   T_out = (T_in - 1) * stride - 2*pad + K + out_pad
 //   groups = C (depthwise: each channel processed independently)
 // ---------------------------------------------------------------------------
@@ -619,11 +617,11 @@ __global__ void conv_transpose1d_depthwise_kernel(const float* x, const float* w
         if (t_up >= 0 && t_up % stride == 0) {
             int t_in = t_up / stride;
             if (t_in >= 0 && t_in < T_in) {
-                sum += w[c * K + k] * x[c * T_in + t_in];
+                sum += w[c * K + k] * x[t_in * C + c];
             }
         }
     }
-    y[c * T_out + t_out] = sum + bias[c];
+    y[t_out * C + c] = sum + bias[c];
 }
 
 void conv_transpose1d_depthwise_f32(const float* x, const float* w, const float* bias,
@@ -637,7 +635,7 @@ void conv_transpose1d_depthwise_f32(const float* x, const float* w, const float*
 }
 
 // ---------------------------------------------------------------------------
-// Nearest-neighbor 2x upsampling: x[C, T] -> y[C, 2*T]
+// Nearest-neighbor 2x upsampling: x[T, C] -> y[2*T, C]
 // ---------------------------------------------------------------------------
 
 __global__ void upsample_nearest_1d_2x_kernel(const float* x, float* y,
@@ -645,9 +643,10 @@ __global__ void upsample_nearest_1d_2x_kernel(const float* x, float* y,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = C * 2 * T;
     if (idx < total) {
-        int c = idx / (2 * T);
-        int t = (idx % (2 * T)) / 2;
-        y[idx] = x[c * T + t];
+        int t_out = idx / C;
+        int c = idx % C;
+        int t_in = t_out / 2;
+        y[idx] = x[t_in * C + c];
     }
 }
 
@@ -704,14 +703,14 @@ void sigmoid_sum_f32(const float* x, float* y, int N, int D,
 }
 
 // ---------------------------------------------------------------------------
-// Tile 1D: broadcast x[C] to y[C, T] (repeat each element T times)
+// Tile 1D: broadcast x[C] to y[T, C] (repeat each element T times)
 // ---------------------------------------------------------------------------
 
 __global__ void tile_1d_kernel(const float* x, float* y, int C, int T) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = C * T;
     if (idx < total) {
-        int c = idx / T;
+        int c = idx % C;
         y[idx] = x[c];
     }
 }
@@ -725,29 +724,29 @@ void tile_1d_f32(const float* x, float* y, int C, int T,
 }
 
 // ---------------------------------------------------------------------------
-// Channel bias add: y[c, t] += bias[c]  for all t
-//   y: [C, T], bias: [C]. One block per channel for coalesced access.
+// Channel bias add: y[t, c] += bias[c]  for all t
+//   y: [T, C], bias: [C]. Flat iteration, extract c = idx % C.
 // ---------------------------------------------------------------------------
 
-__global__ void channel_bias_add_kernel(float* y, const float* bias, int C, int T) {
-    int c = blockIdx.x;
-    if (c >= C) return;
-    float b = bias[c];
-    float* row = y + c * T;
-    for (int t = threadIdx.x; t < T; t += blockDim.x) {
-        row[t] += b;
+__global__ void channel_bias_add_kernel(float* y, const float* bias, int C, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int c = idx % C;
+        y[idx] += bias[c];
     }
 }
 
 void channel_bias_add_f32(float* y, const float* bias, int C, int T,
                             cudaStream_t stream) {
-    int threads = (T + 31) / 32 * 32;
-    if (threads > 256) threads = 256;
-    channel_bias_add_kernel<<<C, threads, 0, stream>>>(y, bias, C, T);
+    int total = C * T;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    channel_bias_add_kernel<<<blocks, threads, 0, stream>>>(y, bias, C, total);
 }
 
 // ---------------------------------------------------------------------------
 // Generalized Conv1d: supports stride, dilation, explicit padding
+//   x: [T_in, C_in], y: [T_out, C_out], w: [C_out, C_in, K]
 //   One warp per (c_out, t_out) pair.
 // ---------------------------------------------------------------------------
 
@@ -764,7 +763,7 @@ __global__ void conv1d_general_kernel(const float* x, const float* w, const floa
         int k = idx % K;
         int t_in = t * stride - padding + k * dilation;
         if (t_in >= 0 && t_in < T_in) {
-            sum += w[co * C_in * K + ci * K + k] * x[ci * T_in + t_in];
+            sum += w[co * C_in * K + ci * K + k] * x[t_in * C_in + ci];
         }
     }
 
@@ -773,7 +772,7 @@ __global__ void conv1d_general_kernel(const float* x, const float* w, const floa
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
 
     if (threadIdx.x == 0) {
-        y[co * T_out + t] = sum + (bias ? bias[co] : 0.0f);
+        y[t * C_out + co] = sum + (bias ? bias[co] : 0.0f);
     }
 }
 
@@ -789,7 +788,7 @@ void conv1d_general_f32(const float* x, const float* w, const float* bias,
 
 // ---------------------------------------------------------------------------
 // ConvTranspose1d (non-depthwise, groups=1)
-//   w: [C_in, C_out, K] (PyTorch ConvTranspose1d weight shape)
+//   x: [T_in, C_in], y: [T_out, C_out], w: [C_in, C_out, K]
 //   For each output position, gather from valid input positions.
 // ---------------------------------------------------------------------------
 
@@ -809,7 +808,7 @@ __global__ void conv_transpose1d_kernel(const float* x, const float* w, const fl
         if (t_up >= 0 && t_up % stride == 0) {
             int t_in = t_up / stride;
             if (t_in >= 0 && t_in < T_in) {
-                sum += w[ci * C_out * K + co * K + k] * x[ci * T_in + t_in];
+                sum += w[ci * C_out * K + co * K + k] * x[t_in * C_in + ci];
             }
         }
     }
@@ -819,7 +818,7 @@ __global__ void conv_transpose1d_kernel(const float* x, const float* w, const fl
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
 
     if (threadIdx.x == 0) {
-        y[co * T_out + t_out] = sum + (bias ? bias[co] : 0.0f);
+        y[t_out * C_out + co] = sum + (bias ? bias[co] : 0.0f);
     }
 }
 
@@ -835,7 +834,7 @@ void conv_transpose1d_f32(const float* x, const float* w, const float* bias,
 
 // ---------------------------------------------------------------------------
 // Snake activation: y = x + (1/alpha) * sin(alpha * x)^2
-//   alpha: [C] (one per channel), x: [C, T]
+//   alpha: [C] (one per channel), x: [T, C]
 // ---------------------------------------------------------------------------
 
 __global__ void snake_kernel(const float* x, const float* alpha, float* y,
@@ -843,7 +842,7 @@ __global__ void snake_kernel(const float* x, const float* alpha, float* y,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = C * T;
     if (idx < total) {
-        int c = idx / T;
+        int c = idx % C;
         float a = alpha[c];
         float val = x[idx];
         float s = sinf(a * val);
@@ -861,6 +860,7 @@ void snake_f32(const float* x, const float* alpha, float* y,
 
 // ---------------------------------------------------------------------------
 // Nearest-neighbor upsampling with arbitrary factor
+//   x: [T_in, C], y: [T_in * factor, C]
 // ---------------------------------------------------------------------------
 
 __global__ void upsample_nearest_kernel(const float* x, float* y, int C,
@@ -869,10 +869,10 @@ __global__ void upsample_nearest_kernel(const float* x, float* y, int C,
     int T_out = T_in * factor;
     int total = C * T_out;
     if (idx < total) {
-        int c = idx / T_out;
-        int t_out = idx % T_out;
+        int t_out = idx / C;
+        int c = idx % C;
         int t_in = t_out / factor;
-        y[idx] = x[c * T_in + t_in];
+        y[idx] = x[t_in * C + c];
     }
 }
 
@@ -885,7 +885,7 @@ void upsample_nearest_f32(const float* x, float* y, int C, int T_in,
 }
 
 // ---------------------------------------------------------------------------
-// Reflection pad 1D
+// Reflection pad 1D: x[T, C] -> y[T+pad_left+pad_right, C]
 // ---------------------------------------------------------------------------
 
 __global__ void reflection_pad_1d_kernel(const float* x, float* y, int C,
@@ -894,8 +894,8 @@ __global__ void reflection_pad_1d_kernel(const float* x, float* y, int C,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = C * T_out;
     if (idx < total) {
-        int c = idx / T_out;
-        int t = idx % T_out;
+        int t = idx / C;
+        int c = idx % C;
         int t_src;
         if (t < pad_left) {
             t_src = pad_left - t;  // reflect from left
@@ -904,7 +904,7 @@ __global__ void reflection_pad_1d_kernel(const float* x, float* y, int C,
         } else {
             t_src = t - pad_left;
         }
-        y[idx] = x[c * T + t_src];
+        y[idx] = x[t_src * C + c];
     }
 }
 
@@ -1221,9 +1221,9 @@ void fused_lstm_f32(const float* Whh, const float* ig_all,
 
 // ---------------------------------------------------------------------------
 // im2col for 1D convolution
-//   x: [C_in, T_in] → col: [C_in*K, T_out]  (row-major)
+//   x: [T_in, C_in] → col: [T_out, C_in*K]  (row-major)
 //   T_out = (T_in + 2*padding - dilation*(K-1) - 1) / stride + 1
-//   col[(c*K+k), t] = x[c, t*stride - padding + k*dilation]  (0 if OOB)
+//   col[t, c*K+k] = x[t*stride - padding + k*dilation, c]  (0 if OOB)
 // ---------------------------------------------------------------------------
 
 __global__ void im2col_1d_kernel(const float* __restrict__ x,
@@ -1231,16 +1231,17 @@ __global__ void im2col_1d_kernel(const float* __restrict__ x,
                                    int C_in, int T_in, int K,
                                    int stride, int padding, int dilation,
                                    int T_out) {
-    int total = C_in * K * T_out;
+    int CK = C_in * K;
+    int total = T_out * CK;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < total;
          idx += blockDim.x * gridDim.x) {
-        int t = idx % T_out;
-        int temp = idx / T_out;
-        int k = temp % K;
-        int c = temp / K;
+        int t = idx / CK;
+        int ck = idx % CK;
+        int c = ck / K;
+        int k = ck % K;
         int t_in = t * stride - padding + k * dilation;
-        col[idx] = (t_in >= 0 && t_in < T_in) ? x[c * T_in + t_in] : 0.0f;
+        col[idx] = (t_in >= 0 && t_in < T_in) ? x[t_in * C_in + c] : 0.0f;
     }
 }
 
@@ -1258,26 +1259,27 @@ void im2col_1d_f32(const float* x, float* col,
 
 // ---------------------------------------------------------------------------
 // col2im for 1D transposed convolution (with atomicAdd for overlapping)
-//   col: [C_out*K, T_in] → y: [C_out, T_out]
+//   col: [T_in, C_out*K] → y: [T_out, C_out]
 //   T_out = (T_in - 1) * stride + K - 2*padding
-//   For each (c, k, t_in): y[c, t_in*stride + k - padding] += col[(c*K+k), t_in]
+//   For each (t_in, c, k): y[t_in*stride+k-padding, c] += col[t_in, c*K+k]
 // ---------------------------------------------------------------------------
 
 __global__ void col2im_1d_kernel(const float* __restrict__ col,
                                    float* __restrict__ y,
                                    int C_out, int K, int T_in,
                                    int stride, int padding, int T_out) {
-    int total = C_out * K * T_in;
+    int COK = C_out * K;
+    int total = T_in * COK;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < total;
          idx += blockDim.x * gridDim.x) {
-        int t_in = idx % T_in;
-        int temp = idx / T_in;
-        int k = temp % K;
-        int c = temp / K;
+        int t_in = idx / COK;
+        int ck = idx % COK;
+        int c = ck / K;
+        int k = ck % K;
         int t_out = t_in * stride + k - padding;
         if (t_out >= 0 && t_out < T_out) {
-            atomicAdd(&y[c * T_out + t_out], col[(c * K + k) * T_in + t_in]);
+            atomicAdd(&y[t_out * C_out + c], col[idx]);
         }
     }
 }
@@ -1294,6 +1296,109 @@ void col2im_1d_f32(const float* col, float* y,
     if (blocks > 65535) blocks = 65535;
     col2im_1d_kernel<<<blocks, threads, 0, stream>>>(
         col, y, C_out, K, T_in, stride, padding, T_out);
+}
+
+// ---------------------------------------------------------------------------
+// Concatenate along channels for [T, C] layout
+//   a: [T, Ca], b: [T, Cb] → y: [T, Ca+Cb]
+//   y[t, 0..Ca-1] = a[t, :], y[t, Ca..Ca+Cb-1] = b[t, :]
+// ---------------------------------------------------------------------------
+
+__global__ void concat_channels_kernel(const float* a, const float* b, float* y,
+                                         int T, int Ca, int Cb) {
+    int Cy = Ca + Cb;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * Cy;
+    if (idx < total) {
+        int t = idx / Cy;
+        int c = idx % Cy;
+        y[idx] = (c < Ca) ? a[t * Ca + c] : b[t * Cb + (c - Ca)];
+    }
+}
+
+void concat_channels_f32(const float* a, const float* b, float* y,
+                           int T, int Ca, int Cb, cudaStream_t stream) {
+    int total = T * (Ca + Cb);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    concat_channels_kernel<<<blocks, threads, 0, stream>>>(a, b, y, T, Ca, Cb);
+}
+
+// ---------------------------------------------------------------------------
+// Concatenate 4 tensors along channels for [T, C] layout
+//   a: [T, Ca], b: [T, Cb], c: [T, Cc], d: [T, Cd] → y: [T, Ca+Cb+Cc+Cd]
+// ---------------------------------------------------------------------------
+
+__global__ void concat4_channels_kernel(const float* a, const float* b,
+                                          const float* c, const float* d,
+                                          float* y,
+                                          int T, int Ca, int Cb, int Cc, int Cd) {
+    int Cy = Ca + Cb + Cc + Cd;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * Cy;
+    if (idx < total) {
+        int t = idx / Cy;
+        int ch = idx % Cy;
+        float val;
+        if (ch < Ca) {
+            val = a[t * Ca + ch];
+        } else if (ch < Ca + Cb) {
+            val = b[t * Cb + (ch - Ca)];
+        } else if (ch < Ca + Cb + Cc) {
+            val = c[t * Cc + (ch - Ca - Cb)];
+        } else {
+            val = d[t * Cd + (ch - Ca - Cb - Cc)];
+        }
+        y[idx] = val;
+    }
+}
+
+void concat4_channels_f32(const float* a, const float* b,
+                            const float* c, const float* d,
+                            float* y,
+                            int T, int Ca, int Cb, int Cc, int Cd,
+                            cudaStream_t stream) {
+    int total = T * (Ca + Cb + Cc + Cd);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    concat4_channels_kernel<<<blocks, threads, 0, stream>>>(
+        a, b, c, d, y, T, Ca, Cb, Cc, Cd);
+}
+
+// ---------------------------------------------------------------------------
+// Concatenate 3 tensors along channels for [T, C] layout
+//   a: [T, Ca], b: [T, Cb], c: [T, Cc] → y: [T, Ca+Cb+Cc]
+// ---------------------------------------------------------------------------
+
+__global__ void concat3_channels_kernel(const float* a, const float* b,
+                                          const float* c, float* y,
+                                          int T, int Ca, int Cb, int Cc) {
+    int Cy = Ca + Cb + Cc;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * Cy;
+    if (idx < total) {
+        int t = idx / Cy;
+        int ch = idx % Cy;
+        float val;
+        if (ch < Ca) {
+            val = a[t * Ca + ch];
+        } else if (ch < Ca + Cb) {
+            val = b[t * Cb + (ch - Ca)];
+        } else {
+            val = c[t * Cc + (ch - Ca - Cb)];
+        }
+        y[idx] = val;
+    }
+}
+
+void concat3_channels_f32(const float* a, const float* b, const float* c,
+                            float* y, int T, int Ca, int Cb, int Cc,
+                            cudaStream_t stream) {
+    int total = T * (Ca + Cb + Cc);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    concat3_channels_kernel<<<blocks, threads, 0, stream>>>(
+        a, b, c, y, T, Ca, Cb, Cc);
 }
 
 // ---------------------------------------------------------------------------

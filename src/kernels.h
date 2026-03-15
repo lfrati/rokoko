@@ -1,6 +1,7 @@
 // kernels.h — Custom CUDA kernel launch wrappers for Rokoko TTS
 //
 // All kernels operate on FP32 data.
+// Signal tensors use [T, C] layout (time-major, channels last).
 
 #pragma once
 
@@ -75,8 +76,8 @@ void transpose_f32(const float* x, float* y, int M, int N,
                    cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Conv1d: y[c_out, t] = sum_{c_in, k} w[c_out, c_in, k] * x[c_in, t+k-pad] + b[c_out]
-//   x: [C_in, T], w: [C_out, C_in, K], b: [C_out], y: [C_out, T]
+// Conv1d: y[t, c_out] = sum_{c_in, k} w[c_out, c_in, k] * x[t+k-pad, c_in] + b[c_out]
+//   x: [T, C_in], w: [C_out, C_in, K], b: [C_out], y: [T, C_out]
 //   Padding = (K-1)/2 for same-padding.
 // ---------------------------------------------------------------------------
 void conv1d_f32(const float* x, const float* w, const float* bias,
@@ -91,9 +92,9 @@ void weight_norm_f32(const float* wg, const float* wv, float* w,
                      int C_out, int fan_in, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Channels-first LayerNorm: normalize across C at each time position
-//   x, y: [C, T], gamma, beta: [C]
-//   For each t: y[:, t] = gamma * (x[:, t] - mean) / sqrt(var + eps) + beta
+// LayerNorm across channels: normalize across C at each time position
+//   x, y: [T, C], gamma, beta: [C]
+//   For each t: y[t, :] = gamma * (x[t, :] - mean) / sqrt(var + eps) + beta
 // ---------------------------------------------------------------------------
 void layer_norm_channels_first_f32(const float* x, const float* gamma,
                                     const float* beta, float* y,
@@ -108,24 +109,24 @@ void cast_i64_to_i32(const int64_t* src, int* dst, int N,
 
 // ---------------------------------------------------------------------------
 // Instance normalization 1D: normalize each channel across time
-//   x, y: [C, T], weight, bias: [C]
-//   For each c: y[c,t] = weight[c] * (x[c,t] - mean_c) / sqrt(var_c + eps) + bias[c]
+//   x, y: [T, C], weight, bias: [C]
+//   For each c: y[t,c] = weight[c] * (x[t,c] - mean_c) / sqrt(var_c + eps) + bias[c]
 // ---------------------------------------------------------------------------
 void instance_norm_1d_f32(const float* x, const float* weight, const float* bias,
                            float* y, int C, int T, float eps,
                            cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Style affine 1D: y[c,t] = (1 + gamma[c]) * x[c,t] + beta[c]
-//   x, y: [C, T], gamma, beta: [C]
+// Style affine 1D: y[t,c] = (1 + gamma[c]) * x[t,c] + beta[c]
+//   x, y: [T, C], gamma, beta: [C]
 // ---------------------------------------------------------------------------
 void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
                            float* y, int C, int T, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Fused InstanceNorm + StyleAffine: single-pass AdaIN
-//   y[c,t] = (1+gamma[c]) * (norm_w[c] * (x[c,t]-mean)/sqrt(var+eps) + norm_b[c]) + beta[c]
-//   x, y: [C, T], norm_w, norm_b: [C], gamma, beta: [C]
+//   y[t,c] = (1+gamma[c]) * (norm_w[c] * (x[t,c]-mean)/sqrt(var+eps) + norm_b[c]) + beta[c]
+//   x, y: [T, C], norm_w, norm_b: [C], gamma, beta: [C]
 // ---------------------------------------------------------------------------
 void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* norm_b, const float* gamma,
@@ -143,7 +144,7 @@ void ada_layer_norm_f32(const float* x, const float* gamma, const float* beta,
                          cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Depthwise transposed Conv1d: x[C, T_in] -> y[C, T_out]
+// Depthwise transposed Conv1d: x[T_in, C] -> y[T_out, C]
 //   T_out = (T_in - 1) * stride - 2*pad + K + out_pad
 //   w: [C, 1, K], bias: [C], groups = C
 // ---------------------------------------------------------------------------
@@ -153,7 +154,7 @@ void conv_transpose1d_depthwise_f32(const float* x, const float* w, const float*
                                       cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Nearest-neighbor 2x upsampling: x[C, T] -> y[C, 2*T]
+// Nearest-neighbor 2x upsampling: x[T, C] -> y[2*T, C]
 // ---------------------------------------------------------------------------
 void upsample_nearest_1d_2x_f32(const float* x, float* y, int C, int T,
                                   cudaStream_t stream);
@@ -172,22 +173,22 @@ void sigmoid_sum_f32(const float* x, float* y, int N, int D,
                       cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Tile 1D: broadcast x[C] to y[C, T]  (y[c,t] = x[c] for all t)
+// Tile 1D: broadcast x[C] to y[T, C]  (y[t,c] = x[c] for all t)
 // ---------------------------------------------------------------------------
 void tile_1d_f32(const float* x, float* y, int C, int T,
                   cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Channel bias add: y[c, t] += bias[c]  for all t
-//   y: [C, T], bias: [C]
+// Channel bias add: y[t, c] += bias[c]  for all t
+//   y: [T, C], bias: [C]
 // ---------------------------------------------------------------------------
 void channel_bias_add_f32(float* y, const float* bias, int C, int T,
                             cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Generalized Conv1d with stride, dilation, explicit padding
-//   x: [C_in, T_in], w: [C_out, C_in, K], b: [C_out] or nullptr
-//   y: [C_out, T_out]
+//   x: [T_in, C_in], w: [C_out, C_in, K], b: [C_out] or nullptr
+//   y: [T_out, C_out]
 //   T_out = (T_in + 2*padding - dilation*(K-1) - 1) / stride + 1
 // ---------------------------------------------------------------------------
 void conv1d_general_f32(const float* x, const float* w, const float* bias,
@@ -197,8 +198,8 @@ void conv1d_general_f32(const float* x, const float* w, const float* bias,
 
 // ---------------------------------------------------------------------------
 // ConvTranspose1d (non-depthwise, groups=1)
-//   x: [C_in, T_in], w: [C_in, C_out, K], b: [C_out] or nullptr
-//   y: [C_out, T_out]
+//   x: [T_in, C_in], w: [C_in, C_out, K], b: [C_out] or nullptr
+//   y: [T_out, C_out]
 //   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
 // ---------------------------------------------------------------------------
 void conv_transpose1d_f32(const float* x, const float* w, const float* bias,
@@ -208,21 +209,21 @@ void conv_transpose1d_f32(const float* x, const float* w, const float* bias,
 
 // ---------------------------------------------------------------------------
 // Snake activation: y = x + (1/alpha) * sin(alpha * x)^2
-//   x, y: [C, T], alpha: [C] (one per channel)
+//   x, y: [T, C], alpha: [C] (one per channel)
 // ---------------------------------------------------------------------------
 void snake_f32(const float* x, const float* alpha, float* y,
                int C, int T, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Nearest-neighbor upsampling with arbitrary integer factor
-//   x: [C, T_in], y: [C, T_in * factor]
+//   x: [T_in, C], y: [T_in * factor, C]
 // ---------------------------------------------------------------------------
 void upsample_nearest_f32(const float* x, float* y, int C, int T_in,
                            int factor, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Reflection pad 1D: pad left by pad_left, right by pad_right
-//   x: [C, T], y: [C, T + pad_left + pad_right]
+//   x: [T, C], y: [T + pad_left + pad_right, C]
 // ---------------------------------------------------------------------------
 void reflection_pad_1d_f32(const float* x, float* y, int C, int T,
                             int pad_left, int pad_right,
@@ -281,7 +282,7 @@ void fused_lstm_f32(const float* Whh, const float* ig_all,
                      cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// im2col for 1D convolution: x[C_in, T_in] → col[C_in*K, T_out]
+// im2col for 1D convolution: x[T_in, C_in] → col[T_out, C_in*K]
 //   T_out = (T_in + 2*padding - dilation*(K-1) - 1) / stride + 1
 // ---------------------------------------------------------------------------
 void im2col_1d_f32(const float* x, float* col,
@@ -290,14 +291,37 @@ void im2col_1d_f32(const float* x, float* col,
                     cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// col2im for 1D transposed convolution: col[C_out*K, T_in] → y[C_out, T_out]
+// col2im for 1D transposed convolution: col[T_in, C_out*K] → y[T_out, C_out]
 //   T_out = (T_in - 1) * stride + K - 2*padding
-//   Uses atomicAdd for overlapping positions. Zeros y before accumulating.
+//   Uses atomicAdd for overlapping positions.
 // ---------------------------------------------------------------------------
 void col2im_1d_f32(const float* col, float* y,
                     int C_out, int K, int T_in,
                     int stride, int padding, int T_out,
                     cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Concatenate along channels for [T, C] layout
+//   a: [T, Ca], b: [T, Cb] → y: [T, Ca+Cb]
+// ---------------------------------------------------------------------------
+void concat_channels_f32(const float* a, const float* b, float* y,
+                           int T, int Ca, int Cb, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Concatenate 3 tensors along channels: a[T,Ca] + b[T,Cb] + c[T,Cc] → y[T,Ca+Cb+Cc]
+// ---------------------------------------------------------------------------
+void concat3_channels_f32(const float* a, const float* b, const float* c,
+                            float* y, int T, int Ca, int Cb, int Cc,
+                            cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Concatenate 4 tensors along channels: a[T,Ca]+b[T,Cb]+c[T,Cc]+d[T,Cd] → y[T,Ca+Cb+Cc+Cd]
+// ---------------------------------------------------------------------------
+void concat4_channels_f32(const float* a, const float* b,
+                            const float* c, const float* d,
+                            float* y,
+                            int T, int Ca, int Cb, int Cc, int Cd,
+                            cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // SineGen phase computation: f0[L2] → phase_low[L2 * 9]

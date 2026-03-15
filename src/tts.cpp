@@ -9,6 +9,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -102,10 +103,8 @@ static void sgemm_bias(cublasLtHandle_t ltHandle,
 }
 
 // ---------------------------------------------------------------------------
-// im2col + cuBLAS Conv1d: x[C_in, T_in] * w[C_out, C_in, K] + b[C_out] → y[C_out, T_out]
-//   No cuDNN — uses im2col to unfold input, then cuBLAS SGEMM with TF32 tensor cores.
-//   w[C_out, C_in, K] is already contiguous as [C_out, C_in*K] — no reshape needed.
-//   For K=1, stride=1, dilation=1: skip im2col entirely (direct GEMM).
+// im2col + cuBLAS Conv1d: x[T_in, C_in] * w[C_out, C_in, K] + b[C_out] → y[T_out, C_out]
+//   With [T,C] layout, lda=CK, ldb=CK, ldc=C_out — all model constants, always aligned.
 // ---------------------------------------------------------------------------
 
 static void gemm_conv1d(cublasHandle_t cublas,
@@ -126,20 +125,23 @@ static void gemm_conv1d(cublasHandle_t cublas,
         col = col_buf;
     }
 
-    // SGEMM: y[C_out, T_out] = w[C_out, CK] × col[CK, T_out]
-    // Column-major trick: C^T = B^T × A^T
-    //   col row-major [CK, T_out] = col-major [T_out, CK], lda=T_out
-    //   w   row-major [C_out, CK] = col-major [CK, C_out], ldb=CK
-    //   y   row-major [C_out, T_out] = col-major [T_out, C_out], ldc=T_out
+    // SGEMM: y[T_out, C_out] = col[T_out, CK] × w^T[CK, C_out]
+    // Row-major [T_out, C_out] = col-major [C_out, T_out]
+    //   col row-major [T_out, CK] = col-major [CK, T_out], ldb=CK
+    //   w   row-major [C_out, CK] = col-major [CK, C_out], so w^T = OP_T on col-major
+    //   y   row-major [T_out, C_out] = col-major [C_out, T_out], ldc=C_out
+    // cuBLAS col-major: C[C_out,T_out] = op(A)[C_out,CK] * op(B)[CK,T_out]
+    //   A=w (col-major [CK,C_out]), transa=OP_T → [C_out,CK]
+    //   B=col (col-major [CK,T_out]), transb=OP_N → [CK,T_out]
     float alpha = 1.0f, beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(cublas,
-                             CUBLAS_OP_N, CUBLAS_OP_N,
-                             T_out, C_out, CK,
+                             CUBLAS_OP_T, CUBLAS_OP_N,
+                             C_out, T_out, CK,
                              &alpha,
-                             col, T_out,
-                             w, CK,
+                             w, CK,        // lda=CK (model constant, aligned)
+                             col, CK,      // ldb=CK (model constant, aligned)
                              &beta,
-                             y, T_out));
+                             y, C_out));    // ldc=C_out (model constant, aligned)
 
     if (bias) {
         channel_bias_add_f32(y, bias, C_out, T_out, stream);
@@ -147,7 +149,7 @@ static void gemm_conv1d(cublasHandle_t cublas,
 }
 
 // im2col + cuBLAS ConvTranspose1d: GEMM + col2im
-//   x[C_in, T_in] * w[C_in, C_out, K] → y[C_out, T_out]
+//   x[T_in, C_in] * w[C_in, C_out, K] → y[T_out, C_out]
 //   T_out = (T_in - 1) * stride - 2*padding + K + output_padding
 static void gemm_conv_transpose1d(cublasHandle_t cublas,
                                     const float* x, const float* w, const float* bias,
@@ -158,21 +160,24 @@ static void gemm_conv_transpose1d(cublasHandle_t cublas,
     int T_out = (T_in - 1) * stride - 2 * padding + K + output_padding;
     int COK = C_out * K;
 
-    // GEMM: col[C_out*K, T_in] = w^T[COK, C_in] × x[C_in, T_in]
-    // w is row-major [C_in, COK] = col-major [COK, C_in]
-    // We need w^T: use CUBLAS_OP_T on w (col-major [COK, C_in] → transposed [C_in, COK])
-    // x is row-major [C_in, T_in] = col-major [T_in, C_in]
-    // col^T [T_in, COK] = x^T [T_in, C_in] × w^T→ [C_in, COK]
+    // GEMM: col[T_in, COK] = x[T_in, C_in] × w[C_in, COK]
+    // Row-major [T_in, COK] = col-major [COK, T_in]
+    //   x row-major [T_in, C_in] = col-major [C_in, T_in], ldb=C_in
+    //   w row-major [C_in, COK] = col-major [COK, C_in], lda=COK
+    //   col = col-major [COK, T_in], ldc=COK
+    // cuBLAS: C[COK,T_in] = A[COK,C_in] * B[C_in,T_in]
+    //   A=w (col-major [COK,C_in]), transa=OP_N
+    //   B=x (col-major [C_in,T_in]), transb=OP_N
     float* col_buf = workspace;
     float alpha = 1.0f, beta_zero = 0.0f;
     CUBLAS_CHECK(cublasSgemm(cublas,
-                             CUBLAS_OP_N, CUBLAS_OP_T,
-                             T_in, COK, C_in,
+                             CUBLAS_OP_N, CUBLAS_OP_N,
+                             COK, T_in, C_in,
                              &alpha,
-                             x, T_in,          // A: col-major [T_in, C_in]
-                             w, COK,           // B: col-major [COK, C_in], transposed → [C_in, COK]
+                             w, COK,           // A: col-major [COK, C_in]
+                             x, C_in,          // B: col-major [C_in, T_in]
                              &beta_zero,
-                             col_buf, T_in));   // C: col-major [T_in, COK] = row-major [COK, T_in]
+                             col_buf, COK));    // C: col-major [COK, T_in] = row-major [T_in, COK]
 
     // Initialize y: broadcast bias or zero
     if (bias) {
@@ -181,7 +186,7 @@ static void gemm_conv_transpose1d(cublasHandle_t cublas,
         cudaMemsetAsync(y, 0, (size_t)C_out * T_out * sizeof(float), stream);
     }
 
-    // col2im: scatter col[C_out*K, T_in] → y[C_out, T_out] via atomicAdd
+    // col2im: scatter col[T_in, COK] → y[T_out, C_out] via atomicAdd
     col2im_1d_f32(col_buf, y, C_out, K, T_in, stride, padding, T_out, stream);
 }
 
@@ -297,15 +302,13 @@ static void albert_forward(const Weights& w, AlbertBuffers& buf,
 // ---------------------------------------------------------------------------
 
 struct TextEncoderBuffers {
-    float* emb = nullptr;       // [512, T] embedding (channels-first)
-    float* conv_out = nullptr;  // [512, T] conv output / working buffer
-    float* lstm_in = nullptr;   // [T, 512] LSTM input (row-major)
+    float* emb = nullptr;       // [T, 512] embedding (time-major)
+    float* conv_out = nullptr;  // [T, 512] conv output / working buffer
     float* lstm_out = nullptr;  // [T, 512] LSTM output
 
     void alloc(int T, GpuArena& arena) {
-        emb      = arena.alloc<float>(512 * T);
-        conv_out = arena.alloc<float>(512 * T);
-        lstm_in  = arena.alloc<float>(T * 512);
+        emb      = arena.alloc<float>(T * 512);
+        conv_out = arena.alloc<float>(T * 512);
         lstm_out = arena.alloc<float>(T * 512);
     }
 };
@@ -317,30 +320,27 @@ static void bilstm_gpu(const float* d_input, float* d_output,
                         cublasHandle_t cublas, cudaStream_t stream,
                         GpuArena& arena);
 
-// Run text encoder: input_ids[T] -> output[512, T]
+// Run text encoder: input_ids[T] -> output[T, 512]
 static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
                                   const int* token_ids_gpu,
                                   cublasHandle_t cublas, cudaStream_t stream,
                                   int T, GpuArena& arena,
                                   float* workspace = nullptr,
                                   size_t workspace_bytes = 0) {
-    // Step 1: Embedding lookup -> [T, 512]
+    // Step 1: Embedding lookup -> [T, 512] — already in [T, C] layout
     float* te_embed_w = w.get("text_encoder.embedding.weight");
-    embedding_gather(te_embed_w, token_ids_gpu, buf.lstm_in, T, 512, stream);
+    embedding_gather(te_embed_w, token_ids_gpu, buf.emb, T, 512, stream);
 
-    // Transpose [T, 512] -> [512, T] for channels-first CNN
-    transpose_f32(buf.lstm_in, buf.emb, T, 512, stream);
-
-    // Step 2: 3 Conv blocks
-    float* x = buf.emb;  // current activation [512, T]
+    // Step 2: 3 Conv blocks — all kernels now operate on [T, C]
+    float* x = buf.emb;  // current activation [T, 512]
     for (int i = 0; i < 3; i++) {
         auto& blk = w.text_conv[i];
 
-        // Conv1d: [512, T] -> [512, T] — wv already has precomputed weight
+        // Conv1d: [T, 512] -> [T, 512] — wv already has precomputed weight
         gemm_conv1d(cublas, x, blk.conv_wv, blk.conv_b, buf.conv_out,
                      workspace, workspace_bytes, 512, 512, T, 5, 1, 2, 1, stream);
 
-        // Channels-first LayerNorm
+        // LayerNorm across channels
         layer_norm_channels_first_f32(buf.conv_out, blk.ln_w, blk.ln_b,
                                        buf.conv_out, 512, T, 1e-5f, stream);
 
@@ -353,9 +353,7 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
         buf.conv_out = tmp;
     }
 
-    // Step 3: Bidirectional LSTM
-    transpose_f32(x, buf.lstm_in, 512, T, stream);
-
+    // Step 3: Bidirectional LSTM — data is already [T, 512], no transpose needed
     Weights::BiLSTMWeights te_lstm_w;
     te_lstm_w.wih_fwd = w.text_lstm_wih_fwd;
     te_lstm_w.whh_fwd = w.text_lstm_whh_fwd;
@@ -367,11 +365,12 @@ static void text_encoder_forward(const Weights& w, TextEncoderBuffers& buf,
     te_lstm_w.bhh_rev = w.text_lstm_bhh_rev;
     te_lstm_w.bias_fwd = w.text_lstm_bias_fwd;
     te_lstm_w.bias_rev = w.text_lstm_bias_rev;
-    bilstm_gpu(buf.lstm_in, buf.lstm_out, te_lstm_w, T, 512, 256, cublas, stream, arena);
+    bilstm_gpu(x, buf.lstm_out, te_lstm_w, T, 512, 256, cublas, stream, arena);
 
-    // Transpose [T, 512] -> [512, T] for output
-    transpose_f32(buf.lstm_out, buf.emb, T, 512, stream);
-    // Final result is in buf.emb [512, T]
+    // Copy LSTM output back to emb for downstream use
+    cudaMemcpyAsync(buf.emb, buf.lstm_out, T * 512 * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+    // Final result is in buf.emb [T, 512]
 }
 
 // ---------------------------------------------------------------------------
@@ -454,8 +453,8 @@ static void bilstm_gpu(const float* d_input, float* d_output,
 
 // ---------------------------------------------------------------------------
 // AdaIN1d forward: InstanceNorm(affine) + style conditioning
-//   x: [C, T] on GPU, s: [style_dim] on GPU
-//   output written to y: [C, T] on GPU
+//   x: [T, C] on GPU, s: [style_dim] on GPU
+//   output written to y: [T, C] on GPU
 //   Uses AdaIN1dWeights (norm.weight/bias, fc.weight/bias)
 // ---------------------------------------------------------------------------
 
@@ -479,7 +478,7 @@ static void adain_1d_forward(const float* x, const float* style,
 
 // ---------------------------------------------------------------------------
 // AdainResBlk1d forward
-//   x: [dim_in, T] -> y: [dim_out, T_out]
+//   x: [T, dim_in] -> y: [T_out, dim_out]
 //   T_out = T (no upsample) or 2*T (upsample=True)
 // ---------------------------------------------------------------------------
 
@@ -668,8 +667,8 @@ static void sinegen_cpu(const float* f0, int L2,
 // ---------------------------------------------------------------------------
 // AdaINResBlock1 forward (Generator resblocks with Snake activation)
 //   3 rounds of: adain1 → Snake → dilated_conv → adain2 → Snake → conv → residual
-//   x: [C, T] in-place, output: [C, T]
-//   Working buffers: xt_buf [C, T], conv_out_buf [C, T], fc_buf [2*C]
+//   x: [T, C] in-place, output: [T, C]
+//   Working buffers: xt_buf [T, C], conv_out_buf [T, C], fc_buf [2*C]
 // ---------------------------------------------------------------------------
 
 static void adain_resblock1_forward(float* x, const float* style,
@@ -784,11 +783,10 @@ size_t compute_decode_bytes(int T, int L) {
     size_t max_ws_floats = (size_t)128 * 11 * har_frames;
     off = a(off, max_ws_floats * sizeof(float));
 
-    // Alignment matrix + expanded encoder + shared LSTM I/O
+    // Alignment matrix + expanded encoder + shared LSTM output
     off = a(off, (size_t)T * L * sizeof(float));        // d_alignment
-    off = a(off, (size_t)640 * L * sizeof(float));       // d_en_expanded
-    off = a(off, (size_t)L * 640 * sizeof(float));       // d_shared_in
-    off = a(off, (size_t)L * 512 * sizeof(float));       // d_shared_out
+    off = a(off, (size_t)L * 640 * sizeof(float));       // d_en_expanded [L, 640]
+    off = a(off, (size_t)L * 512 * sizeof(float));       // d_shared_out [L, 512]
 
     // F0/N working buffers (shared across both chains)
     off = a(off, (size_t)512 * L2 * sizeof(float));      // d_res_buf
@@ -800,10 +798,10 @@ size_t compute_decode_bytes(int T, int L) {
     off = a(off, (size_t)L2 * sizeof(float));             // d_n_pred
 
     // Decoder inputs
-    off = a(off, (size_t)512 * L * sizeof(float));        // d_asr_aligned
+    off = a(off, (size_t)L * 512 * sizeof(float));        // d_asr_aligned [L, 512]
     off = a(off, (size_t)L * sizeof(float));              // d_f0_down
     off = a(off, (size_t)L * sizeof(float));              // d_n_down
-    off = a(off, (size_t)514 * L * sizeof(float));        // d_dec_cat
+    off = a(off, (size_t)L * 514 * sizeof(float));        // d_dec_cat [L, 514]
 
     // Decoder working buffers
     int max_ch = 1090;
@@ -812,18 +810,19 @@ size_t compute_decode_bytes(int T, int L) {
     off = a(off, (size_t)2 * max_ch * sizeof(float));    // d_dec_fc
 
     // Decoder blocks
-    off = a(off, (size_t)1024 * L * sizeof(float));       // d_dec_out (encode block)
-    off = a(off, (size_t)64 * L * sizeof(float));         // d_asr_res
-    off = a(off, (size_t)1090 * L2 * sizeof(float));      // d_dec_in
+    off = a(off, (size_t)L * 1024 * sizeof(float));       // d_dec_out [L, 1024]
+    off = a(off, (size_t)L * 64 * sizeof(float));         // d_asr_res [L, 64]
+    off = a(off, (size_t)L2 * 1090 * sizeof(float));      // d_dec_in [L2, 1090]
 
-    // Decode blocks 0-2: 1024*L each; block 3: 512*L2 (has_upsample)
+    // Decode blocks 0-2: L*1024 each; block 3: L2*512 (has_upsample)
     for (int i = 0; i < 3; i++)
-        off = a(off, (size_t)1024 * L * sizeof(float));
-    off = a(off, (size_t)512 * L2 * sizeof(float));
+        off = a(off, (size_t)L * 1024 * sizeof(float));
+    off = a(off, (size_t)L2 * 512 * sizeof(float));
 
-    // Generator: d_gen_har persists, SineGen temps are save/restored and overlap
-    // with the generator pool that follows.
-    off = a(off, (size_t)22 * har_frames * sizeof(float)); // d_gen_har
+    // Generator: d_gen_har_ct [22, har_frames] persists through STFT,
+    // then d_gen_har [har_frames, 22] (transposed) persists for generator.
+    // SineGen temps overlap with gen_har_ct area after restore.
+    off = a(off, (size_t)22 * har_frames * sizeof(float)); // d_gen_har_ct
     size_t sinegen_off = off;
     // SineGen temporaries (reclaimed via save/restore)
     size_t sg = off;
@@ -831,9 +830,12 @@ size_t compute_decode_bytes(int T, int L) {
     sg = a(sg, (size_t)T_audio * sizeof(float));            // d_har_source
     sg = a(sg, (size_t)9 * sizeof(float));                  // d_rand_ini
 
+    // After sinegen restore, d_gen_har (transposed) is allocated
+    off = a(off, (size_t)har_frames * 22 * sizeof(float));  // d_gen_har [har_frames, 22]
+
     // Generator working pool: 5 slots of 128*har_frames (buffers reused via liveness)
-    // Overlaps with SineGen temps — take the max.
-    size_t gen_pool_end = a(sinegen_off, (size_t)5 * 128 * har_frames * sizeof(float));
+    // Must account for max of sinegen temps or gen pool
+    size_t gen_pool_end = a(off, (size_t)5 * 128 * har_frames * sizeof(float));
     off = (sg > gen_pool_end) ? sg : gen_pool_end;
     off = a(off, (size_t)512 * sizeof(float));              // d_gen_fc
 
@@ -842,6 +844,14 @@ size_t compute_decode_bytes(int T, int L) {
 
     return off;
 }
+
+// ---------------------------------------------------------------------------
+// Encode-phase CUDA graph cache: keyed by T (token count).
+// All arena allocations are deterministic per T, so cached graphs
+// use the same device pointers on replay.
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<int, cudaGraphExec_t> s_encode_graph_cache;
 
 // ---------------------------------------------------------------------------
 // Rokoko inference: phoneme IDs + style vector → audio
@@ -859,100 +869,99 @@ std::vector<float> rokoko_infer(const Weights& w,
                                 size_t workspace_bytes) {
     arena.reset();
 
-    // Upload token IDs to GPU
+    // ---- All arena allocations upfront (deterministic per T) ----
     int* d_token_ids = arena.alloc<int>(T);
-    CUDA_CHECK(cudaMemcpy(d_token_ids, token_ids, T * sizeof(int),
-                           cudaMemcpyHostToDevice));
-
-    // Upload style vector
     float* d_ref_s = arena.alloc<float>(256);
-    CUDA_CHECK(cudaMemcpy(d_ref_s, style_vec, 256 * sizeof(float),
-                           cudaMemcpyHostToDevice));
-    float* d_style_prosody = d_ref_s + 128;  // second half
-    float* d_style_acoustic = d_ref_s;        // first half
+    float* d_style_prosody = d_ref_s + 128;
+    float* d_style_acoustic = d_ref_s;
 
-    // ---- ALBERT encoder ----
     AlbertBuffers albert_buf;
     albert_buf.alloc(T, arena);
-    CUDA_CHECK(cudaMemcpy(albert_buf.token_ids, d_token_ids, T * sizeof(int),
-                           cudaMemcpyDeviceToDevice));
-    albert_forward(w, albert_buf, cublas, ltHandle, stream, T);
 
-    // bert_encoder: Linear 768→512 (GEMM + fused bias)
-    float* d_bert_enc = arena.alloc<float>(T * 512);
-    sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 512, T, 768,
-               w.bert_enc_w, 768, albert_buf.hidden, 768, d_bert_enc, 512,
-               w.bert_enc_b, stream);
-
-    // Transpose to d_en: [T, 512] → [512, T]
     float* d_en = arena.alloc<float>(T * 512);
-    transpose_f32(d_bert_enc, d_en, T, 512, stream);
 
-    // ---- Text encoder ----
     TextEncoderBuffers te_buf;
     te_buf.alloc(T, arena);
-    text_encoder_forward(w, te_buf, d_token_ids, cublas, stream, T, arena,
-                         d_workspace, workspace_bytes);
-    // te_buf.emb is [512, T]
 
-    // ---- Prosody predictor ----
-    // DurationEncoder: 3x (BiLSTM + AdaLN) with style concatenation
-    float* d_cat_buf  = arena.alloc<float>(640 * T);
-    float* d_lstm_tmp = arena.alloc<float>(T * 640);
+    float* d_style_tiled = arena.alloc<float>(T * 128);
+    float* d_cat_buf  = arena.alloc<float>(T * 640);
     float* d_lstm_out = arena.alloc<float>(T * 512);
-    float* d_x_buf    = arena.alloc<float>(640 * T);
+    float* d_x_buf    = arena.alloc<float>(T * 512);
     float* d_ada_fc   = arena.alloc<float>(1024);
 
-    // Initialize: d_en [512, T] + tiled style [128, T] → [640, T]
-    cudaMemcpyAsync(d_cat_buf, d_en, 512 * T * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
-    tile_1d_f32(d_style_prosody, d_cat_buf + 512 * T, 128, T, stream);
+    float* d_dur_lstm_out = arena.alloc<float>(T * 512);
+    float* d_dur_proj     = arena.alloc<float>(T * 50);
+    float* d_durations    = arena.alloc<float>(T);
+    int*   d_int_durations = arena.alloc<int>(T);
+    int*   d_L             = arena.alloc<int>(1);
 
-    for (int layer_i = 0; layer_i < 3; layer_i++) {
-        // BiLSTM: [640, T] → [T, 640] → BiLSTM → [T, 512] → [512, T]
-        transpose_f32(d_cat_buf, d_lstm_tmp, 640, T, stream);
-        bilstm_gpu(d_lstm_tmp, d_lstm_out, w.dur_enc_lstm[layer_i],
-                   T, 640, 256, cublas, stream, arena);
-        transpose_f32(d_lstm_out, d_x_buf, T, 512, stream);
+    // ---- H2D uploads (outside graph — blocking) ----
+    CUDA_CHECK(cudaMemcpy(d_token_ids, token_ids, T * sizeof(int),
+                           cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ref_s, style_vec, 256 * sizeof(float),
+                           cudaMemcpyHostToDevice));
 
-        // AdaLayerNorm
-        transpose_f32(d_x_buf, d_lstm_tmp, 512, T, stream);
-        auto& aln = w.dur_enc_aln[layer_i];
-        sgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 1024, 1, 128,
-              aln.fc_w, 128, d_style_prosody, 128, d_ada_fc, 1024);
-        bias_add_f32(d_ada_fc, aln.fc_b, d_ada_fc, 1, 1024, stream);
-        ada_layer_norm_f32(d_lstm_tmp, d_ada_fc, d_ada_fc + 512,
-                           d_lstm_tmp, T, 512, 1e-5f, stream);
-        transpose_f32(d_lstm_tmp, d_x_buf, T, 512, stream);
+    // ---- Encode phase: CUDA graph capture/replay ----
+    auto git = s_encode_graph_cache.find(T);
+    if (git == s_encode_graph_cache.end()) {
+        // Provide cuBLAS workspace to prevent cudaMalloc during capture
+        cublasSetWorkspace(cublas, d_workspace, workspace_bytes);
 
-        // Re-cat style: [512, T] + [128, T] → [640, T]
-        cudaMemcpyAsync(d_cat_buf, d_x_buf, 512 * T * sizeof(float),
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+        // ALBERT encoder
+        cudaMemcpyAsync(albert_buf.token_ids, d_token_ids, T * sizeof(int),
                         cudaMemcpyDeviceToDevice, stream);
-        tile_1d_f32(d_style_prosody, d_cat_buf + 512 * T, 128, T, stream);
+        albert_forward(w, albert_buf, cublas, ltHandle, stream, T);
+
+        // bert_encoder: Linear 768→512 → d_en [T, 512]
+        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 512, T, 768,
+                   w.bert_enc_w, 768, albert_buf.hidden, 768, d_en, 512,
+                   w.bert_enc_b, stream);
+
+        // Text encoder
+        text_encoder_forward(w, te_buf, d_token_ids, cublas, stream, T, arena,
+                             d_workspace, workspace_bytes);
+
+        // Duration encoder: 3x (BiLSTM + AdaLN)
+        tile_1d_f32(d_style_prosody, d_style_tiled, 128, T, stream);
+        concat_channels_f32(d_en, d_style_tiled, d_cat_buf, T, 512, 128, stream);
+
+        for (int layer_i = 0; layer_i < 3; layer_i++) {
+            bilstm_gpu(d_cat_buf, d_lstm_out, w.dur_enc_lstm[layer_i],
+                       T, 640, 256, cublas, stream, arena);
+
+            auto& aln = w.dur_enc_aln[layer_i];
+            sgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 1024, 1, 128,
+                  aln.fc_w, 128, d_style_prosody, 128, d_ada_fc, 1024);
+            bias_add_f32(d_ada_fc, aln.fc_b, d_ada_fc, 1, 1024, stream);
+            ada_layer_norm_f32(d_lstm_out, d_ada_fc, d_ada_fc + 512,
+                               d_x_buf, T, 512, 1e-5f, stream);
+
+            concat_channels_f32(d_x_buf, d_style_tiled, d_cat_buf, T, 512, 128, stream);
+        }
+
+        // Duration LSTM + projection
+        bilstm_gpu(d_cat_buf, d_dur_lstm_out, w.dur_lstm,
+                   T, 640, 256, cublas, stream, arena);
+        sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 50, T, 512,
+                   w.dur_proj_w, 512, d_dur_lstm_out, 512, d_dur_proj, 50,
+                   w.dur_proj_b, stream);
+        sigmoid_sum_f32(d_dur_proj, d_durations, T, 50, stream);
+        round_clamp_durations_f32(d_durations, d_int_durations, d_L, T, stream);
+
+        cudaGraph_t graph;
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphExec_t exec;
+        cudaGraphInstantiateWithFlags(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+        s_encode_graph_cache[T] = exec;
+        cudaGraphLaunch(exec, stream);
+    } else {
+        cudaGraphLaunch(git->second, stream);
     }
 
-    // Duration LSTM + projection → durations
-    float* d_dur_enc_out = arena.alloc<float>(T * 640);
-    transpose_f32(d_cat_buf, d_dur_enc_out, 640, T, stream);
-
-    float* d_dur_lstm_out = arena.alloc<float>(T * 512);
-    bilstm_gpu(d_dur_enc_out, d_dur_lstm_out, w.dur_lstm,
-               T, 640, 256, cublas, stream, arena);
-
-    float* d_dur_proj = arena.alloc<float>(T * 50);
-    sgemm_bias(ltHandle, CUBLAS_OP_T, CUBLAS_OP_N, 50, T, 512,
-               w.dur_proj_w, 512, d_dur_lstm_out, 512, d_dur_proj, 50,
-               w.dur_proj_b, stream);
-
-    float* d_durations = arena.alloc<float>(T);
-    sigmoid_sum_f32(d_dur_proj, d_durations, T, 50, stream);
-
-    // Round+clamp durations on GPU, compute L
-    int* d_int_durations = arena.alloc<int>(T);
-    int* d_L = arena.alloc<int>(1);
-    round_clamp_durations_f32(d_durations, d_int_durations, d_L, T, stream);
-
-    // Sync for L only (4 bytes) — needed for arena allocation sizing
+    // Sync for L only (4 bytes) — needed for decode arena sizing
     int L;
     CUDA_CHECK(cudaMemcpyAsync(&L, d_L, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -977,20 +986,35 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_alignment = decode_arena.alloc<float>(T * L);
     build_alignment_f32(d_int_durations, d_alignment, T, L, stream);
 
-    // Expand encoder output: [640, T] @ [T, L] → [640, L]
-    float* d_en_expanded = decode_arena.alloc<float>(640 * L);
-    sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, L, 640, T,
-          d_alignment, L, d_cat_buf, T, d_en_expanded, L);
+    // Expand encoder output: alignment^T [L, T] × d_cat_buf [T, 640] → [L, 640]
+    // d_cat_buf is [T, 640] row-major = col-major [640, T]
+    // alignment is [T, L] row-major = col-major [L, T]
+    // We want result [L, 640] row-major = col-major [640, L]
+    // cuBLAS: C[640,L] = A[640,T] * B[T,L]
+    //   A=d_cat_buf (col-major [640,T]), OP_N
+    //   B=d_alignment (col-major [L,T]), OP_T → [T,L]
+    // Wait — alignment col-major [L,T] transposed gives [T,L] which is wrong.
+    // alignment row-major [T,L] = col-major [L,T], we want alignment^T = [L,T].
+    // cuBLAS: C[640,L] = A[640,T] × B[T,L]
+    //   B = alignment^T in row-major = [L,T], but alignment is stored col-major [L,T]
+    //   So OP_N on alignment gives [L,T] → that's T columns, but we need [T,L].
+    // Let me think in cuBLAS col-major terms:
+    //   Result: row-major [L, 640] = col-major [640, L], so m=640, n=L
+    //   C[640,L] = A[640,T] * B[T,L]
+    //   A = d_cat_buf stored as col-major [640, T], lda=640 → BUT d_cat_buf is row-major [T,640]
+    //     = col-major [640, T] with lda=640. YES.
+    //   B = d_alignment stored as col-major [L, T]. We need [T, L] so transb=OP_T, ldb=L
+    float* d_en_expanded = decode_arena.alloc<float>(L * 640);
+    sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, 640, L, T,
+          d_cat_buf, 640, d_alignment, L, d_en_expanded, 640);
 
-    // Shared LSTM: [640, L] → [L, 640] → BiLSTM → [L, 512]
-    float* d_shared_in = decode_arena.alloc<float>(L * 640);
-    transpose_f32(d_en_expanded, d_shared_in, 640, L, stream);
+    // Shared LSTM: d_en_expanded [L, 640] already row-major — no transpose
     float* d_shared_out = decode_arena.alloc<float>(L * 512);
-    bilstm_gpu(d_shared_in, d_shared_out, w.shared_lstm,
+    bilstm_gpu(d_en_expanded, d_shared_out, w.shared_lstm,
                L, 640, 256, cublas, stream, decode_arena);
 
     // F0 and N prediction chains
-    // Both: [L, 512] → [512, L] → 3 AdainResBlk1d → Conv1d proj → [1, 2L]
+    // Both: [L, 512] → 3 AdainResBlk1d → Conv1d proj → [2L, 1]
     float* d_res_buf = decode_arena.alloc<float>(512 * L2);
     float* d_sc_buf  = decode_arena.alloc<float>(512 * L2);
     float* d_fc_buf  = decode_arena.alloc<float>(1024);
@@ -1001,28 +1025,30 @@ std::vector<float> rokoko_infer(const Weights& w,
         size_t chain_save = decode_arena.save();
         float* d_fx = decode_arena.alloc<float>(512 * L2);
         float* d_fo = decode_arena.alloc<float>(512 * L2);
-        transpose_f32(d_shared_out, d_fx, L, 512, stream);
+        // d_shared_out is [L, 512] — already [T, C] layout, no transpose
+        cudaMemcpyAsync(d_fx, d_shared_out, L * 512 * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream);
 
-        // block 0: [512, L] → [512, L]
+        // block 0: [L, 512] → [L, 512]
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[0],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 512, L, 128, cublas, stream,
                                 d_dec_workspace, dec_ws_bytes);
-        // block 1: [512, L] → [256, 2L] (upsample)
+        // block 1: [L, 512] → [2L, 256] (upsample)
         cudaMemcpyAsync(d_fx, d_fo, 512 * L * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[1],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 512, 256, L, 128, cublas, stream,
                                 d_dec_workspace, dec_ws_bytes);
-        // block 2: [256, 2L] → [256, 2L]
+        // block 2: [2L, 256] → [2L, 256]
         cudaMemcpyAsync(d_fx, d_fo, 256 * L2 * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         adain_resblk1d_forward(d_fx, d_style_prosody, blocks[2],
                                 d_res_buf, d_sc_buf, d_fc_buf, d_fo,
                                 256, 256, L2, 128, cublas, stream,
                                 d_dec_workspace, dec_ws_bytes);
-        // Projection: Conv1d(256→1, k=1)
+        // Projection: Conv1d(256→1, k=1) → [2L, 1]
         conv1d_f32(d_fo, proj_w, proj_b, d_pred, 256, 1, L2, 1, stream);
         decode_arena.restore(chain_save);
     };
@@ -1033,13 +1059,12 @@ std::vector<float> rokoko_infer(const Weights& w,
     run_f0n_chain(w.n_blocks, w.n_proj_w, w.n_proj_b, d_n_pred);
 
     // ---- Decoder ----
-    // Build asr_aligned: text encoder [512, T] expanded by durations → [512, L]
-    // Use the alignment matrix already on GPU: asr_aligned = emb @ alignment
-    float* d_asr_aligned = decode_arena.alloc<float>(512 * L);
-    sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, L, 512, T,
-          d_alignment, L, te_buf.emb, T, d_asr_aligned, L);
+    // Build asr_aligned: alignment^T [L, T] × te_buf.emb [T, 512] → [L, 512]
+    float* d_asr_aligned = decode_arena.alloc<float>(L * 512);
+    sgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, 512, L, T,
+          te_buf.emb, 512, d_alignment, L, d_asr_aligned, 512);
 
-    // F0/N downsampling: Conv1d(1,1,k=3,s=2,p=1) on [1, 2L] → [1, L]
+    // F0/N downsampling: Conv1d(1,1,k=3,s=2,p=1) on [2L, 1] → [L, 1]
     float* d_f0_down = decode_arena.alloc<float>(L);
     float* d_n_down  = decode_arena.alloc<float>(L);
 
@@ -1049,14 +1074,10 @@ std::vector<float> rokoko_infer(const Weights& w,
     conv1d_general_f32(d_n_pred, w.dec_n_conv_wv, w.dec_n_conv_b,
                        d_n_down, 1, 1, L2, 3, 2, 1, 1, stream);
 
-    // Concatenate [asr_aligned, F0_down, N_down] → [514, L]
-    float* d_dec_cat = decode_arena.alloc<float>(514 * L);
-    cudaMemcpyAsync(d_dec_cat, d_asr_aligned, 512 * L * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(d_dec_cat + 512 * L, d_f0_down, L * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(d_dec_cat + 513 * L, d_n_down, L * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
+    // Concatenate [asr_aligned, F0_down, N_down] → [L, 514]
+    float* d_dec_cat = decode_arena.alloc<float>(L * 514);
+    concat3_channels_f32(d_asr_aligned, d_f0_down, d_n_down,
+                          d_dec_cat, L, 512, 1, 1, stream);
 
     // Decoder working buffers
     int max_ch = 1090;
@@ -1064,21 +1085,21 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_dec_sc  = decode_arena.alloc<float>(max_ch * L2);
     float* d_dec_fc  = decode_arena.alloc<float>(2 * max_ch);
 
-    // Encode: AdainResBlk1d(514→1024)
-    float* d_dec_out = decode_arena.alloc<float>(1024 * L);
+    // Encode: AdainResBlk1d(514→1024) [L, 514] → [L, 1024]
+    float* d_dec_out = decode_arena.alloc<float>(L * 1024);
     adain_resblk1d_forward(d_dec_cat, d_style_acoustic, w.dec_encode,
                             d_dec_res, d_dec_sc, d_dec_fc, d_dec_out,
                             514, 1024, L, 128, cublas, stream,
                             d_dec_workspace, dec_ws_bytes);
 
     // asr_res: Conv1d(512→64, k=1) — wv has precomputed weight
-    float* d_asr_res = decode_arena.alloc<float>(64 * L);
+    float* d_asr_res = decode_arena.alloc<float>(L * 64);
     conv1d_f32(d_asr_aligned, w.dec_asr_res_wv, w.dec_asr_res_b, d_asr_res,
                512, 64, L, 1, stream);
 
     // Decode blocks [0-3] with skip connections
     float* d_dec_x = d_dec_out;
-    float* d_dec_in = decode_arena.alloc<float>(1090 * L2);
+    float* d_dec_in = decode_arena.alloc<float>(L2 * 1090);
 
     int dim_in_sizes[] = {1090, 1090, 1090, 1090};
     int dim_out_sizes[] = {1024, 1024, 1024, 512};
@@ -1088,21 +1109,17 @@ std::vector<float> rokoko_infer(const Weights& w,
         int T_blk = L;
 
         if (res_flag) {
-            cudaMemcpyAsync(d_dec_in, d_dec_x, 1024 * T_blk * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(d_dec_in + 1024 * T_blk, d_asr_res, 64 * T_blk * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(d_dec_in + 1088 * T_blk, d_f0_down, 1 * T_blk * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(d_dec_in + 1089 * T_blk, d_n_down, 1 * T_blk * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            // Concatenate: d_dec_x [T_blk, 1024] + d_asr_res [T_blk, 64]
+            //            + d_f0_down [T_blk, 1] + d_n_down [T_blk, 1] → [T_blk, 1090]
+            concat4_channels_f32(d_dec_x, d_asr_res, d_f0_down, d_n_down,
+                                  d_dec_in, T_blk, 1024, 64, 1, 1, stream);
         } else {
             cudaMemcpyAsync(d_dec_in, d_dec_x, dim_in_sizes[bi] * T_blk * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
         }
 
         int T_blk_out = w.dec_decode[bi].has_upsample ? 2 * T_blk : T_blk;
-        float* d_blk_out = decode_arena.alloc<float>(dim_out_sizes[bi] * T_blk_out);
+        float* d_blk_out = decode_arena.alloc<float>(T_blk_out * dim_out_sizes[bi]);
         adain_resblk1d_forward(d_dec_in, d_style_acoustic, w.dec_decode[bi],
                                 d_dec_res, d_dec_sc, d_dec_fc, d_blk_out,
                                 dim_in_sizes[bi], dim_out_sizes[bi], T_blk,
@@ -1116,24 +1133,24 @@ std::vector<float> rokoko_infer(const Weights& w,
             L = T_blk_out;  // update L after upsample
         }
     }
-    // d_dec_x is now [512, L2] — generator input
+    // d_dec_x is now [L2, 512] — generator input
 
     // ---- Generator ----
     // SineGen: F0 → harmonic source → STFT → har [22, frames]
+    // STFT output is inherently [n_fft/2+1, n_frames] = [C, T] layout.
+    // gen_har stays in [C, T] layout; the generator noise_convs kernels
+    // use [T, C] layout, so we'll transpose gen_har to [T, C] for them.
     int T_audio = L2 * 300;
     int n_fft_gen = 20, hop_gen = 5;
     int har_frames = T_audio / hop_gen + 1;
 
-    float* d_gen_har = decode_arena.alloc<float>(22 * har_frames);
+    // gen_har stored as [22, har_frames] (STFT output, channels-first)
+    float* d_gen_har_ct = decode_arena.alloc<float>(22 * har_frames);
     {
-        // GPU SineGen: F0 → harmonic source (no CPU sync, no memcpy)
-        // Temporaries (d_phase_low, d_har_source, d_rand_ini) are reclaimed
-        // after STFT completes — safe because all ops are on the same stream.
         size_t sinegen_save = decode_arena.save();
         float* d_phase_low = decode_arena.alloc<float>(L2 * 9);
         float* d_har_source = decode_arena.alloc<float>(T_audio);
 
-        // Upload random initial phases (fundamental=0, overtones=random)
         float rand_ini[9];
         rand_ini[0] = 0.0f;
         std::mt19937 rng(42);
@@ -1143,23 +1160,23 @@ std::vector<float> rokoko_infer(const Weights& w,
         cudaMemcpyAsync(d_rand_ini, rand_ini, 9 * sizeof(float),
                         cudaMemcpyHostToDevice, stream);
 
-        // Phase computation (9 threads, sequential cumsum)
         sinegen_phase_f32(d_f0_pred, d_rand_ini, d_phase_low, L2, stream);
-
-        // Source generation (T_audio threads, all on GPU — no CPU sync needed)
         sinegen_source_f32(d_phase_low, d_f0_pred, w.gen_source_w, w.gen_source_b,
                            d_har_source, L2, T_audio, 42, stream);
 
-        float* d_har_spec = d_gen_har;
-        float* d_har_phase = d_gen_har + 11 * har_frames;
+        float* d_har_spec = d_gen_har_ct;
+        float* d_har_phase = d_gen_har_ct + 11 * har_frames;
         stft_f32(d_har_source, d_har_spec, d_har_phase,
                  T_audio, n_fft_gen, hop_gen, stream);
         decode_arena.restore(sinegen_save);
     }
 
-    // Generator working pool: 5 slots of 128*har_frames each (4x smaller than
-    // the old 5 × 512*har_frames).  Buffers are reassigned per iteration based
-    // on liveness — dead buffers are reused by later steps.
+    // Transpose gen_har from [22, har_frames] → [har_frames, 22] for [T,C] layout
+    // Reuse sinegen temps area (already restored)
+    float* d_gen_har = decode_arena.alloc<float>(har_frames * 22);
+    transpose_f32(d_gen_har_ct, d_gen_har, 22, har_frames, stream);
+
+    // Generator working pool: 5 slots of 128*har_frames each
     size_t gen_slot = (size_t)128 * har_frames;
     float* gen_pool = decode_arena.alloc<float>(5 * gen_slot);
     float* d_gen_fc = decode_arena.alloc<float>(512);
@@ -1188,10 +1205,9 @@ std::vector<float> rokoko_infer(const Weights& w,
         int uk = upsample_kernels[i];
         int up = (uk - us) / 2;
 
-        // d_gen_x = slot0, size C_in * T_loop
         leaky_relu_f32(d_gen_x, d_gen_x, C_in * T_loop, 0.1f, stream);
 
-        // noise_convs[i]: gen_har → slot1 (gen_src)
+        // noise_convs[i]: gen_har [har_frames, 22] → slot1 [src_T, C_out]
         float* d_gen_src = slot1;
         if (i == 0) {
             gemm_conv1d(cublas, d_gen_har, w.gen_noise_convs[i].w,
@@ -1221,7 +1237,7 @@ std::vector<float> rokoko_infer(const Weights& w,
                                d_gen_tmp, d_dec_workspace, dec_ws_bytes,
                                C_in, C_out, T_loop, uk, us, up, 0, stream);
 
-        // Copy/pad tmp → gen_x.  gen_x transitions to C_out * T_ups.
+        // Copy/pad tmp → gen_x
         if (i == 1) {
             reflection_pad_1d_f32(d_gen_tmp, d_gen_x, C_out, T_ups, 1, 0, stream);
             T_ups += 1;
@@ -1230,10 +1246,10 @@ std::vector<float> rokoko_infer(const Weights& w,
                             cudaMemcpyDeviceToDevice, stream);
         }
 
-        // Merge: x += src.  gen_src (slot1) is dead after this.
+        // Merge: x += src
         add_f32(d_gen_x, d_gen_src, d_gen_x, C_out * T_ups, stream);
 
-        // ResBlocks: reuse slot1 as rb_avg (gen_src is dead)
+        // ResBlocks: reuse slot1 as rb_avg
         float* d_rb_avg = slot1;
         CUDA_CHECK(cudaMemsetAsync(d_rb_avg, 0, C_out * T_ups * sizeof(float), stream));
 
@@ -1253,20 +1269,25 @@ std::vector<float> rokoko_infer(const Weights& w,
     }
 
     // Post: LeakyReLU(0.01) + conv_post(128→22, k=7)
+    // Result is [T_loop, 22] in [T,C] layout
     float* d_gen_tmp = slot4;
     leaky_relu_f32(d_gen_x, d_gen_x, 128 * T_loop, 0.01f, stream);
     gemm_conv1d(cublas, d_gen_x, w.gen_conv_post_wv, w.gen_conv_post_b, d_gen_tmp,
                  d_dec_workspace, dec_ws_bytes, 128, 22, T_loop, 7, 1, 3, 1, stream);
 
-    // spec = exp(x[:11,:]), phase = sin(x[11:,:])
+    // Transpose [T_loop, 22] → [22, T_loop] for STFT boundary (channels-first)
+    float* d_gen_ct = d_gen_x;  // reuse slot0 (128*har_frames >> 22*T_loop)
+    transpose_f32(d_gen_tmp, d_gen_ct, T_loop, 22, stream);
+
+    // spec = exp(x[:11,:]), phase = sin(x[11:,:]) — in [C,T] layout
     int n_freqs = 11;
-    exp_f32(d_gen_tmp, d_gen_x, n_freqs * T_loop, stream);
-    sin_f32(d_gen_tmp + n_freqs * T_loop, d_gen_x + n_freqs * T_loop,
+    exp_f32(d_gen_ct, d_gen_tmp, n_freqs * T_loop, stream);
+    sin_f32(d_gen_ct + n_freqs * T_loop, d_gen_tmp + n_freqs * T_loop,
             n_freqs * T_loop, stream);
 
-    // iSTFT → audio
+    // iSTFT → audio (operates on [n_freqs, T_loop] channels-first)
     float* d_audio = decode_arena.alloc<float>(T_audio);
-    istft_f32(d_gen_x, d_gen_x + n_freqs * T_loop, d_audio,
+    istft_f32(d_gen_tmp, d_gen_tmp + n_freqs * T_loop, d_audio,
               T_loop, 20, 5, T_audio, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
