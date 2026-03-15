@@ -110,10 +110,11 @@ using ImplicitGemmSIMT = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKe
 
 struct ConvKey {
     int C_in, C_out, T_in, K, stride, padding, dilation;
+    int mode;  // 0=no-bias, 1=bias(stride-0), 2=residual(packed)
     bool operator==(const ConvKey& o) const {
         return C_in == o.C_in && C_out == o.C_out && T_in == o.T_in &&
                K == o.K && stride == o.stride && padding == o.padding &&
-               dilation == o.dilation;
+               dilation == o.dilation && mode == o.mode;
     }
 };
 
@@ -122,7 +123,7 @@ struct ConvKeyHash {
         size_t h = 0;
         auto mix = [&](int v) { h ^= std::hash<int>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2); };
         mix(k.C_in); mix(k.C_out); mix(k.T_in); mix(k.K);
-        mix(k.stride); mix(k.padding); mix(k.dilation);
+        mix(k.stride); mix(k.padding); mix(k.dilation); mix(k.mode);
         return h;
     }
 };
@@ -186,7 +187,7 @@ template <typename GemmOp, typename CacheMap>
 static int dispatch_conv(CacheMap& cache,
                           const ConvKey& key,
                           const cutlass::conv::Conv2dProblemSize& problem,
-                          float* x, float* w, float* bias_ptr,
+                          float* x, float* w, float* c_ptr,
                           float* y, float* workspace, size_t workspace_bytes,
                           int C_in, int C_out, int T_in, int T_out, int K,
                           float alpha, float beta,
@@ -197,7 +198,7 @@ static int dispatch_conv(CacheMap& cache,
     arguments.problem_size = problem;
     arguments.ref_A = {x, layout_x};
     arguments.ref_B = {w, layout_w};
-    arguments.ref_C = {bias_ptr, layout_bias};
+    arguments.ref_C = {c_ptr, layout_bias};
     arguments.ref_D = {y, layout_y};
     arguments.output_op = {alpha, beta};
 
@@ -236,7 +237,8 @@ static constexpr int SM_COUNT = 70;  // RTX 5070 Ti
 
 extern "C"
 int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
-                          float* y, float* workspace, size_t workspace_bytes,
+                          float* y, const float* residual,
+                          float* workspace, size_t workspace_bytes,
                           int C_in, int C_out, int T_in, int K,
                           int stride, int padding, int dilation,
                           cudaStream_t stream) {
@@ -244,17 +246,37 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
 
     float* x_nc = const_cast<float*>(x);
     float* w_nc = const_cast<float*>(w);
+
+    // Determine C source and beta for the epilogue: D = alpha * conv + beta * C
+    //   residual mode: C = residual (packed), beta = 1 → D = conv + residual
+    //   bias mode:     C = bias (stride-0),   beta = 1 → D = conv + bias
+    //   neither:       C = y (unused),        beta = 0 → D = conv
     float alpha = 1.0f;
-    float beta = bias ? 1.0f : 0.0f;
-    float* bias_ptr = bias ? const_cast<float*>(bias) : y;
+    float beta;
+    float* c_ptr;
+    LayoutNHWC layout_bias;
+
+    if (residual) {
+        beta = 1.0f;
+        c_ptr = const_cast<float*>(residual);
+        layout_bias = LayoutNHWC::packed({1, 1, T_out, C_out});  // packed, same as output
+    } else if (bias) {
+        beta = 1.0f;
+        c_ptr = const_cast<float*>(bias);
+        layout_bias = LayoutNHWC(LayoutNHWC::Stride(0));  // stride-0 broadcast
+    } else {
+        beta = 0.0f;
+        c_ptr = y;
+        layout_bias = LayoutNHWC::packed({1, 1, T_out, C_out});
+    }
 
     LayoutNHWC layout_x = LayoutNHWC::packed({1, 1, T_in, C_in});
     LayoutNHWC layout_w = LayoutNHWC::packed({C_out, 1, K, C_in});
     LayoutNHWC layout_y = LayoutNHWC::packed({1, 1, T_out, C_out});
-    LayoutNHWC layout_bias = bias ? LayoutNHWC(LayoutNHWC::Stride(0)) : layout_y;
 
     auto problem = make_problem(C_in, C_out, T_in, K, stride, padding, dilation);
-    ConvKey key{C_in, C_out, T_in, K, stride, padding, dilation};
+    int mode = residual ? 2 : (bias ? 1 : 0);
+    ConvKey key{C_in, C_out, T_in, K, stride, padding, dilation, mode};
 
     // TF32 path for aligned channels
     if ((C_in % 4 == 0) && (C_out % 4 == 0)) {
@@ -265,7 +287,7 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
             // Large tile: high per-CTA throughput, enough CTAs for full occupancy
             int rc = dispatch_conv<ImplicitGemmTF32Large>(
                 s_tf32_large_cache, key, problem,
-                x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+                x_nc, w_nc, c_ptr, y, workspace, workspace_bytes,
                 C_in, C_out, T_in, T_out, K, alpha, beta,
                 layout_x, layout_w, layout_y, layout_bias, stream);
             if (rc == 0) return 0;
@@ -275,7 +297,7 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
         {
             int rc = dispatch_conv<ImplicitGemmTF32Small>(
                 s_tf32_small_cache, key, problem,
-                x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+                x_nc, w_nc, c_ptr, y, workspace, workspace_bytes,
                 C_in, C_out, T_in, T_out, K, alpha, beta,
                 layout_x, layout_w, layout_y, layout_bias, stream);
             if (rc == 0) return 0;
@@ -285,7 +307,7 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
     // SIMT fallback
     return dispatch_conv<ImplicitGemmSIMT>(
         s_simt_cache, key, problem,
-        x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+        x_nc, w_nc, c_ptr, y, workspace, workspace_bytes,
         C_in, C_out, T_in, T_out, K, alpha, beta,
         layout_x, layout_w, layout_y, layout_bias, stream);
 }

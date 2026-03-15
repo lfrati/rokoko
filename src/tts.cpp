@@ -106,7 +106,8 @@ static void sgemm_bias(cublasLtHandle_t ltHandle,
 // Cutlass implicit GEMM Conv1d (extern, defined in cutlass_conv.cu)
 // ---------------------------------------------------------------------------
 extern "C" int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
-                                     float* y, float* workspace, size_t workspace_bytes,
+                                     float* y, const float* residual,
+                                     float* workspace, size_t workspace_bytes,
                                      int C_in, int C_out, int T_in, int K,
                                      int stride, int padding, int dilation,
                                      cudaStream_t stream);
@@ -121,25 +122,35 @@ static std::unordered_map<const float*, float*> s_w_nhwc;
 // im2col + cuBLAS SGEMM (w in original [C_out, C_in, K] layout).
 // ---------------------------------------------------------------------------
 
+// gemm_conv1d: Conv1d forward.
+//   When residual != nullptr: y = conv(x,w) + residual, then bias_add(y, bias).
+//   When residual == nullptr: y = conv(x,w) + bias (fused in Cutlass epilogue).
 static void gemm_conv1d(cublasHandle_t cublas,
                          const float* x, const float* w, const float* bias,
                          float* y, float* workspace, size_t workspace_bytes,
                          int C_in, int C_out, int T_in, int K,
                          int stride, int padding, int dilation,
-                         cudaStream_t stream) {
+                         cudaStream_t stream,
+                         const float* residual = nullptr) {
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
     int CK = C_in * K;
 
-    // Try Cutlass implicit GEMM for large convolutions (needs NHWC weights, K>1)
+    // Try Cutlass implicit GEMM (needs NHWC weights, K>1)
     if (K > 1) {
         auto it = s_w_nhwc.find(w);
         if (it != s_w_nhwc.end()) {
-            int rc = cutlass_conv1d_fprop(x, it->second, bias, y,
-                                           workspace, workspace_bytes,
+            // With residual: Cutlass does y = conv + residual, bias added after
+            // Without residual: Cutlass does y = conv + bias (fused epilogue)
+            const float* cutlass_bias = residual ? nullptr : bias;
+            int rc = cutlass_conv1d_fprop(x, it->second, cutlass_bias, y,
+                                           residual, workspace, workspace_bytes,
                                            C_in, C_out, T_in, K,
                                            stride, padding, dilation, stream);
-            if (rc == 0) return;  // Cutlass succeeded
-            // Fall through to cuBLAS on failure
+            if (rc == 0) {
+                if (residual && bias)
+                    channel_bias_add_f32(y, bias, C_out, T_out, stream);
+                return;
+            }
         }
     }
 
@@ -162,6 +173,9 @@ static void gemm_conv1d(cublasHandle_t cublas,
                              &beta,
                              y, C_out));
 
+    if (residual) {
+        add_f32(y, residual, y, C_out * T_out, stream);
+    }
     if (bias) {
         channel_bias_add_f32(y, bias, C_out, T_out, stream);
     }
@@ -722,10 +736,9 @@ static void adain_resblock1_forward(float* x, const float* style,
         snake_f32(xt_buf, rb.alpha2[j], xt_buf, C, T, stream);
 
         int pad2 = (K - 1) / 2;
-        gemm_conv1d(cublas, xt_buf, rb.convs2[j].wv, rb.convs2[j].b, conv_out_buf,
-                     workspace, workspace_bytes, C, C, T, K, 1, pad2, 1, stream);
-
-        add_f32(conv_out_buf, x, x, C * T, stream);
+        gemm_conv1d(cublas, xt_buf, rb.convs2[j].wv, rb.convs2[j].b, x,
+                     workspace, workspace_bytes, C, C, T, K, 1, pad2, 1, stream,
+                     x);  // residual: x = conv(xt_buf) + x, then + bias
     }
 }
 
