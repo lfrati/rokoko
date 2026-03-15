@@ -103,8 +103,22 @@ static void sgemm_bias(cublasLtHandle_t ltHandle,
 }
 
 // ---------------------------------------------------------------------------
-// im2col + cuBLAS Conv1d: x[T_in, C_in] * w[C_out, C_in, K] + b[C_out] → y[T_out, C_out]
-//   With [T,C] layout, lda=CK, ldb=CK, ldc=C_out — all model constants, always aligned.
+// Cutlass implicit GEMM Conv1d (extern, defined in cutlass_conv.cu)
+// ---------------------------------------------------------------------------
+extern "C" int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
+                                     float* y, float* workspace, size_t workspace_bytes,
+                                     int C_in, int C_out, int T_in, int K,
+                                     int stride, int padding, int dilation,
+                                     cudaStream_t stream);
+extern "C" void cutlass_reshape_weights(const float* src, float* dst,
+                                         int C_out, int C_in, int K, cudaStream_t stream);
+
+// NHWC weight map: wv pointer → w_nhwc pointer (populated at startup)
+static std::unordered_map<const float*, float*> s_w_nhwc;
+
+// ---------------------------------------------------------------------------
+// Conv1d forward: tries Cutlass implicit GEMM first (w_nhwc), falls back to
+// im2col + cuBLAS SGEMM (w in original [C_out, C_in, K] layout).
 // ---------------------------------------------------------------------------
 
 static void gemm_conv1d(cublasHandle_t cublas,
@@ -116,7 +130,21 @@ static void gemm_conv1d(cublasHandle_t cublas,
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
     int CK = C_in * K;
 
-    // For K=1, stride=1, pad=0, dilation=1: x IS the "col" matrix (no im2col)
+    // Try Cutlass implicit GEMM for large convolutions (needs NHWC weights, K>1)
+    // Only beneficial when the problem is large enough to amortize launch overhead.
+    if (K > 1) {
+        auto it = s_w_nhwc.find(w);
+        if (it != s_w_nhwc.end()) {
+            int rc = cutlass_conv1d_fprop(x, it->second, bias, y,
+                                           workspace, workspace_bytes,
+                                           C_in, C_out, T_in, K,
+                                           stride, padding, dilation, stream);
+            if (rc == 0) return;  // Cutlass succeeded
+            // Fall through to cuBLAS on failure
+        }
+    }
+
+    // cuBLAS path: im2col + SGEMM
     const float* col = x;
     if (K > 1 || stride > 1 || padding > 0 || dilation > 1) {
         float* col_buf = workspace;
@@ -125,23 +153,15 @@ static void gemm_conv1d(cublasHandle_t cublas,
         col = col_buf;
     }
 
-    // SGEMM: y[T_out, C_out] = col[T_out, CK] × w^T[CK, C_out]
-    // Row-major [T_out, C_out] = col-major [C_out, T_out]
-    //   col row-major [T_out, CK] = col-major [CK, T_out], ldb=CK
-    //   w   row-major [C_out, CK] = col-major [CK, C_out], so w^T = OP_T on col-major
-    //   y   row-major [T_out, C_out] = col-major [C_out, T_out], ldc=C_out
-    // cuBLAS col-major: C[C_out,T_out] = op(A)[C_out,CK] * op(B)[CK,T_out]
-    //   A=w (col-major [CK,C_out]), transa=OP_T → [C_out,CK]
-    //   B=col (col-major [CK,T_out]), transb=OP_N → [CK,T_out]
     float alpha = 1.0f, beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(cublas,
                              CUBLAS_OP_T, CUBLAS_OP_N,
                              C_out, T_out, CK,
                              &alpha,
-                             w, CK,        // lda=CK (model constant, aligned)
-                             col, CK,      // ldb=CK (model constant, aligned)
+                             w, CK,
+                             col, CK,
                              &beta,
-                             y, C_out));    // ldc=C_out (model constant, aligned)
+                             y, C_out));
 
     if (bias) {
         channel_bias_add_f32(y, bias, C_out, T_out, stream);
@@ -1418,6 +1438,76 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
         precompute_lstm_bias(w.dur_enc_lstm[i], 256);
     precompute_lstm_bias(w.dur_lstm, 256);
     precompute_lstm_bias(w.shared_lstm, 256);
+
+    // ---- Precompute NHWC weights for Cutlass implicit GEMM ----
+    // Reshape [C_out, C_in, K] → [C_out, K, C_in] for Conv1d weights with K>1.
+    // K=1 convolutions are just GEMMs and don't benefit from implicit GEMM.
+    auto make_nhwc = [&](float* wv, int C_out, int C_in, int K) {
+        if (K <= 1) return;
+        float* w_nhwc = nullptr;
+        CUDA_CHECK(cudaMalloc(&w_nhwc, (size_t)C_out * C_in * K * sizeof(float)));
+        cutlass_reshape_weights(wv, w_nhwc, C_out, C_in, K, stream);
+        s_w_nhwc[wv] = w_nhwc;
+    };
+
+    // Text encoder conv blocks (K=5)
+    for (int i = 0; i < 3; i++)
+        make_nhwc(w.text_conv[i].conv_wv, 512, 512, 5);
+
+    // F0/N AdainResBlk1d conv weights (K=3)
+    {
+        int dim_in[]  = {512, 512, 256};
+        int dim_out[] = {512, 256, 256};
+        for (auto* blocks : {w.f0_blocks, w.n_blocks}) {
+            for (int i = 0; i < 3; i++) {
+                make_nhwc(blocks[i].conv1_wv, dim_out[i], dim_in[i], 3);
+                make_nhwc(blocks[i].conv2_wv, dim_out[i], dim_out[i], 3);
+            }
+        }
+    }
+
+    // Decoder F0/N downsample (K=3)
+    make_nhwc(w.dec_f0_conv_wv, 1, 1, 3);
+    make_nhwc(w.dec_n_conv_wv, 1, 1, 3);
+
+    // Decoder encode block (K=3)
+    make_nhwc(w.dec_encode.conv1_wv, 1024, 514, 3);
+    make_nhwc(w.dec_encode.conv2_wv, 1024, 1024, 3);
+
+    // Decoder decode blocks (K=3)
+    for (int i = 0; i < Weights::DEC_N_DECODE; i++) {
+        int dim_in = 1090;
+        int dim_out = (i < 3) ? 1024 : 512;
+        make_nhwc(w.dec_decode[i].conv1_wv, dim_out, dim_in, 3);
+        make_nhwc(w.dec_decode[i].conv2_wv, dim_out, dim_out, 3);
+    }
+
+    // Generator resblocks (K varies: 3, 7, 11)
+    for (int i = 0; i < Weights::GEN_N_RESBLOCKS; i++) {
+        auto& rb = w.gen_resblocks[i];
+        int C = rb.channels, K = rb.kernel_size;
+        for (int j = 0; j < 3; j++) {
+            make_nhwc(rb.convs1[j].wv, C, C, K);
+            make_nhwc(rb.convs2[j].wv, C, C, K);
+        }
+    }
+
+    // Generator noise_res (K varies)
+    for (int i = 0; i < Weights::GEN_N_UPS; i++) {
+        auto& rb = w.gen_noise_res[i];
+        int C = rb.channels, K = rb.kernel_size;
+        for (int j = 0; j < 3; j++) {
+            make_nhwc(rb.convs1[j].wv, C, C, K);
+            make_nhwc(rb.convs2[j].wv, C, C, K);
+        }
+    }
+
+    // Generator conv_post (K=7)
+    make_nhwc(w.gen_conv_post_wv, 22, 128, 7);
+
+    // Generator noise_convs (not weight-normed, use .w not .wv)
+    make_nhwc(w.gen_noise_convs[0].w, 128, 22, 12);  // K=12, stride=6
+    // noise_convs[1] has K=1, skip
 
     cudaStreamSynchronize(stream);
 }
