@@ -647,25 +647,31 @@ void ada_layer_norm_f32(const float* x, const float* gamma, const float* beta,
 //   groups = C (depthwise: each channel processed independently)
 // ---------------------------------------------------------------------------
 
-__global__ void conv_transpose1d_depthwise_kernel(const float* x, const float* w,
-                                                    const float* bias, float* y,
+__global__ void conv_transpose1d_depthwise_kernel(const float* __restrict__ x,
+                                                    const float* __restrict__ w,
+                                                    const float* __restrict__ bias,
+                                                    float* __restrict__ y,
                                                     int C, int T_in, int T_out,
                                                     int K, int stride, int pad) {
-    int c = blockIdx.x;
-    int t_out = blockIdx.y;
-    if (c >= C || t_out >= T_out) return;
+    int total = C * T_out;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += blockDim.x * gridDim.x) {
+        int t_out = idx / C;
+        int c = idx % C;
 
-    float sum = 0.0f;
-    for (int k = 0; k < K; k++) {
-        int t_up = t_out + pad - k;
-        if (t_up >= 0 && t_up % stride == 0) {
-            int t_in = t_up / stride;
-            if (t_in >= 0 && t_in < T_in) {
-                sum += w[c * K + k] * x[t_in * C + c];
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            int t_up = t_out + pad - k;
+            if (t_up >= 0 && t_up % stride == 0) {
+                int t_in = t_up / stride;
+                if (t_in >= 0 && t_in < T_in) {
+                    sum += w[c * K + k] * x[t_in * C + c];
+                }
             }
         }
+        y[idx] = sum + bias[c];
     }
-    y[t_out * C + c] = sum + bias[c];
 }
 
 void conv_transpose1d_depthwise_f32(const float* x, const float* w, const float* bias,
@@ -673,8 +679,10 @@ void conv_transpose1d_depthwise_f32(const float* x, const float* w, const float*
                                       int stride, int pad, int out_pad,
                                       cudaStream_t stream) {
     int T_out = (T_in - 1) * stride - 2 * pad + K + out_pad;
-    dim3 blocks(C, T_out);
-    conv_transpose1d_depthwise_kernel<<<blocks, 1, 0, stream>>>(
+    int total = C * T_out;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    conv_transpose1d_depthwise_kernel<<<blocks, threads, 0, stream>>>(
         x, w, bias, y, C, T_in, T_out, K, stride, pad);
 }
 
