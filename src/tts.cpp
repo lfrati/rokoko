@@ -887,6 +887,16 @@ size_t compute_decode_bytes(int T, int L) {
 
 static std::unordered_map<int, cudaGraphExec_t> s_encode_graph_cache;
 
+// Decode-phase CUDA graph cache: keyed by (T << 32 | L).
+// Arena allocations are deterministic per (T,L), so cached graphs
+// use the same device pointers on replay.
+struct DecodeGraph {
+    cudaGraphExec_t exec;
+    size_t audio_offset;  // byte offset of d_audio from decode_arena.base
+};
+static std::unordered_map<int64_t, DecodeGraph> s_decode_graph_cache;
+static float* s_d_rand_ini = nullptr;  // persistent rand_ini on GPU (seed=42)
+
 // ---------------------------------------------------------------------------
 // Rokoko inference: phoneme IDs + style vector → audio
 // ---------------------------------------------------------------------------
@@ -929,11 +939,11 @@ std::vector<float> rokoko_infer(const Weights& w,
     int*   d_int_durations = arena.alloc<int>(T);
     int*   d_L             = arena.alloc<int>(1);
 
-    // ---- H2D uploads (outside graph — blocking) ----
-    CUDA_CHECK(cudaMemcpy(d_token_ids, token_ids, T * sizeof(int),
-                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ref_s, style_vec, 256 * sizeof(float),
-                           cudaMemcpyHostToDevice));
+    // ---- H2D uploads (async, stream-ordered before encode graph) ----
+    CUDA_CHECK(cudaMemcpyAsync(d_token_ids, token_ids, T * sizeof(int),
+                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_ref_s, style_vec, 256 * sizeof(float),
+                                cudaMemcpyHostToDevice, stream));
 
     // ---- Encode phase: CUDA graph capture/replay ----
     auto git = s_encode_graph_cache.find(T);
@@ -1000,15 +1010,55 @@ std::vector<float> rokoko_infer(const Weights& w,
     CUDA_CHECK(cudaMemcpyAsync(&L, d_L, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int L2 = 2 * L;
+    int T_audio_actual = L2 * 300;  // actual audio length for download
+
+    // Bucket L for decode graph cache hit rate: different L values
+    // within the same bucket share a single cached graph.
+    static constexpr int DECODE_L_BUCKET = 32;
+    L = ((L + DECODE_L_BUCKET - 1) / DECODE_L_BUCKET) * DECODE_L_BUCKET;
+    L2 = 2 * L;
+    int T_audio = L2 * 300;  // padded — used by decode operations
 
     // ===== DECODE PHASE: exact-sized arena =====
     size_t decode_bytes = compute_decode_bytes(T, L);
     if (decode_arena.capacity < decode_bytes) {
+        // Arena grows — invalidate all cached decode graphs
+        for (auto& [k, dg] : s_decode_graph_cache)
+            cudaGraphExecDestroy(dg.exec);
+        s_decode_graph_cache.clear();
         decode_arena.destroy();
         decode_arena.init(decode_bytes);
     } else {
         decode_arena.reset();
     }
+
+    // Lazy-init persistent rand_ini device buffer (SineGen, seed=42)
+    if (!s_d_rand_ini) {
+        float ri[9] = {0};
+        std::mt19937 rng_ri(42);
+        std::uniform_real_distribution<float> uni_ri(0.0f, 1.0f);
+        for (int h = 1; h < 9; h++) ri[h] = uni_ri(rng_ri);
+        CUDA_CHECK(cudaMalloc(&s_d_rand_ini, 9 * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(s_d_rand_ini, ri, 9 * sizeof(float),
+                               cudaMemcpyHostToDevice));
+    }
+
+    // Decode graph cache: replay if available
+    int64_t decode_key = ((int64_t)T << 32) | (int64_t)(unsigned int)L;
+    auto dgit = s_decode_graph_cache.find(decode_key);
+    if (dgit != s_decode_graph_cache.end()) {
+        float* d_audio = (float*)(decode_arena.base + dgit->second.audio_offset);
+        cudaGraphLaunch(dgit->second.exec, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> audio(T_audio_actual);
+        cudaMemcpy(audio.data(), d_audio, T_audio_actual * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        return audio;
+    }
+
+    // First time for (T, L): capture decode graph
+    cublasSetWorkspace(cublas, d_workspace, workspace_bytes);
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
 
     // Decode workspace (first alloc, matches compute_decode_bytes order)
     int har_frames_ws = (L2 * 300) / 5 + 1;
@@ -1174,7 +1224,6 @@ std::vector<float> rokoko_infer(const Weights& w,
     // STFT output is inherently [n_fft/2+1, n_frames] = [C, T] layout.
     // gen_har stays in [C, T] layout; the generator noise_convs kernels
     // use [T, C] layout, so we'll transpose gen_har to [T, C] for them.
-    int T_audio = L2 * 300;
     int n_fft_gen = 20, hop_gen = 5;
     int har_frames = T_audio / hop_gen + 1;
 
@@ -1185,16 +1234,8 @@ std::vector<float> rokoko_infer(const Weights& w,
         float* d_phase_low = decode_arena.alloc<float>(L2 * 9);
         float* d_har_source = decode_arena.alloc<float>(T_audio);
 
-        float rand_ini[9];
-        rand_ini[0] = 0.0f;
-        std::mt19937 rng(42);
-        std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-        for (int h = 1; h < 9; h++) rand_ini[h] = uni(rng);
-        float* d_rand_ini = decode_arena.alloc<float>(9);
-        cudaMemcpyAsync(d_rand_ini, rand_ini, 9 * sizeof(float),
-                        cudaMemcpyHostToDevice, stream);
-
-        sinegen_phase_f32(d_f0_pred, d_rand_ini, d_phase_low, L2, stream);
+        // Use persistent s_d_rand_ini (pre-allocated outside graph capture)
+        sinegen_phase_f32(d_f0_pred, s_d_rand_ini, d_phase_low, L2, stream);
         sinegen_source_f32(d_phase_low, d_f0_pred, w.gen_source_w, w.gen_source_b,
                            d_har_source, L2, T_audio, 42, stream);
 
@@ -1323,11 +1364,22 @@ std::vector<float> rokoko_infer(const Weights& w,
     float* d_audio = decode_arena.alloc<float>(T_audio);
     istft_f32(d_gen_tmp, d_gen_tmp + n_freqs * T_loop, d_audio,
               T_loop, 20, 5, T_audio, stream);
+    // End decode graph capture
+    cudaGraph_t decode_graph;
+    cudaStreamEndCapture(stream, &decode_graph);
+    cudaGraphExec_t decode_exec;
+    cudaGraphInstantiateWithFlags(&decode_exec, decode_graph, 0);
+    cudaGraphDestroy(decode_graph);
+
+    size_t audio_offset = (size_t)((char*)d_audio - decode_arena.base);
+    s_decode_graph_cache[decode_key] = {decode_exec, audio_offset};
+
+    cudaGraphLaunch(decode_exec, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Download audio
-    std::vector<float> audio(T_audio);
-    cudaMemcpy(audio.data(), d_audio, T_audio * sizeof(float),
+    // Download audio (actual length, not padded)
+    std::vector<float> audio(T_audio_actual);
+    cudaMemcpy(audio.data(), d_audio, T_audio_actual * sizeof(float),
                cudaMemcpyDeviceToHost);
 
     return audio;
