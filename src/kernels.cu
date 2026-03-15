@@ -545,12 +545,14 @@ void style_affine_1d_f32(const float* x, const float* gamma, const float* beta,
 // ---------------------------------------------------------------------------
 
 // Pass 2: compute mean/var from reduction buffer, normalize + style affine
+// When snake_alpha != nullptr, applies snake activation: val + sin²(a*val)/a
 __global__ void instnorm_style_norm_kernel(
         const float* __restrict__ x,
         const float* __restrict__ red_sum,
         const float* __restrict__ red_sum_sq,
         const float* __restrict__ norm_w, const float* __restrict__ norm_b,
         const float* __restrict__ gamma, const float* __restrict__ beta,
+        const float* __restrict__ snake_alpha,
         float* __restrict__ y,
         int C, int T, float eps) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -566,9 +568,18 @@ __global__ void instnorm_style_norm_kernel(
     float combined_scale = g * norm_w[c] * inv_std;
     float combined_bias = g * (norm_b[c] - norm_w[c] * mean * inv_std) + beta[c];
 
-    // Normalize with coalesced reads/writes
+    // Optional snake activation params
+    float a = snake_alpha ? snake_alpha[c] : 0.0f;
+    float inv_a = snake_alpha ? (1.0f / a) : 0.0f;
+
+    // Normalize with coalesced reads/writes + optional snake
     for (int t = blockIdx.y; t < T; t += gridDim.y) {
-        y[t * C + c] = combined_scale * x[t * C + c] + combined_bias;
+        float val = combined_scale * x[t * C + c] + combined_bias;
+        if (snake_alpha) {
+            float s = sinf(a * val);
+            val += s * s * inv_a;
+        }
+        y[t * C + c] = val;
     }
 }
 
@@ -577,7 +588,8 @@ void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* beta, float* y,
                                       float* workspace,
                                       int C, int T, float eps,
-                                      cudaStream_t stream) {
+                                      cudaStream_t stream,
+                                      const float* snake_alpha) {
     float* red_sum = workspace;
     float* red_sum_sq = workspace + C;
     cudaMemsetAsync(workspace, 0, 2 * C * sizeof(float), stream);
@@ -593,7 +605,8 @@ void instance_norm_style_affine_f32(const float* x, const float* norm_w,
         x, red_sum, red_sum_sq, C, T);
 
     instnorm_style_norm_kernel<<<grid, threads, 0, stream>>>(
-        x, red_sum, red_sum_sq, norm_w, norm_b, gamma, beta, y, C, T, eps);
+        x, red_sum, red_sum_sq, norm_w, norm_b, gamma, beta, snake_alpha,
+        y, C, T, eps);
 }
 
 // ---------------------------------------------------------------------------

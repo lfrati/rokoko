@@ -491,23 +491,22 @@ static void bilstm_gpu(const float* d_input, float* d_output,
 //   Uses AdaIN1dWeights (norm.weight/bias, fc.weight/bias)
 // ---------------------------------------------------------------------------
 
+// AdaIN1d forward, optionally fusing snake activation into the norm output.
+// When snake_alpha != nullptr: y = snake(norm(x, style), alpha)
 static void adain_1d_forward(const float* x, const float* style,
                               const Weights::AdaIN1dWeights& ain_w,
                               float* y, float* fc_buf, float* norm_ws,
                               int C, int T, int style_dim,
-                              cublasHandle_t cublas, cudaStream_t stream) {
-    // Step 1: fc(style) -> [2*C] = [gamma, beta]
-    // fc_buf must be >= 2*C floats
+                              cublasHandle_t cublas, cudaStream_t stream,
+                              const float* snake_alpha = nullptr) {
     sgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 2*C, 1, style_dim,
           ain_w.fc_w, style_dim, style, style_dim, fc_buf, 2*C);
     bias_add_f32(fc_buf, ain_w.fc_b, fc_buf, 1, 2*C, stream);
 
-    // Step 2: Fused InstanceNorm + StyleAffine (two-pass coalesced)
-    // gamma = fc_buf[0..C-1], beta = fc_buf[C..2C-1]
-    // norm_ws must be >= 2*C floats (reduction buffer)
     instance_norm_style_affine_f32(x, ain_w.norm_w, ain_w.norm_b,
                                     fc_buf, fc_buf + C, y,
-                                    norm_ws, C, T, 1e-5f, stream);
+                                    norm_ws, C, T, 1e-5f, stream,
+                                    snake_alpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -723,8 +722,7 @@ static void adain_resblock1_forward(float* x, const float* style,
     float* norm_ws = fc_buf + 2 * C;
     for (int j = 0; j < 3; j++) {
         adain_1d_forward(x, style, rb.adain1[j], xt_buf, fc_buf, norm_ws,
-                         C, T, style_dim, cublas, stream);
-        snake_f32(xt_buf, rb.alpha1[j], xt_buf, C, T, stream);
+                         C, T, style_dim, cublas, stream, rb.alpha1[j]);
 
         int d = dilations[j];
         int pad = (K * d - d) / 2;
@@ -732,8 +730,7 @@ static void adain_resblock1_forward(float* x, const float* style,
                      workspace, workspace_bytes, C, C, T, K, 1, pad, d, stream);
 
         adain_1d_forward(conv_out_buf, style, rb.adain2[j], xt_buf, fc_buf, norm_ws,
-                         C, T, style_dim, cublas, stream);
-        snake_f32(xt_buf, rb.alpha2[j], xt_buf, C, T, stream);
+                         C, T, style_dim, cublas, stream, rb.alpha2[j]);
 
         int pad2 = (K - 1) / 2;
         gemm_conv1d(cublas, xt_buf, rb.convs2[j].wv, rb.convs2[j].b, x,

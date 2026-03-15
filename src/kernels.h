@@ -134,7 +134,8 @@ void instance_norm_style_affine_f32(const float* x, const float* norm_w,
                                       const float* beta, float* y,
                                       float* workspace,  // [2*C] reduction buffer
                                       int C, int T, float eps,
-                                      cudaStream_t stream);
+                                      cudaStream_t stream,
+                                      const float* snake_alpha = nullptr);
 
 // ---------------------------------------------------------------------------
 // Adaptive LayerNorm: normalize rows, then style conditioning
