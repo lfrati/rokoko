@@ -9,6 +9,7 @@ NVFLAGS  = -std=c++17 -O3 -arch=native -I$(CUDA_HOME)/include -Isrc --expt-relax
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lpthread
 
 .PHONY: clean
+.DEFAULT_GOAL := rokoko
 
 src/kernels.o: src/kernels.cu src/kernels.h
 	$(NVCC) $(NVFLAGS) -c $< -o $@

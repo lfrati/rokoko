@@ -1,8 +1,8 @@
 // cutlass_conv.cu — Cutlass implicit GEMM Conv1d (via Conv2d with H=1)
 //
 // Replaces im2col + cuBLAS SGEMM with a single Cutlass kernel launch.
-// Uses TF32 TensorOp (tensor cores) with NHWC layout = [T, C] for 1D.
-// Falls back to SIMT (CUDA cores) when alignment requirements aren't met.
+// Two TF32 TensorOp tile sizes: 128x128 (large problems) and 64x64 (small).
+// SIMT fallback for unaligned channels (C not divisible by 4).
 // Fuses per-channel bias into the GEMM epilogue.
 //
 // Operator caching: each unique problem shape gets initialize() once.
@@ -29,35 +29,57 @@ using ElementCompute     = float;
 using LayoutNHWC         = cutlass::layout::TensorNHWC;
 
 // ---------------------------------------------------------------------------
-// TF32 TensorOp path (requires C_in and C_out divisible by 4)
-// Uses tensor cores with 128-bit (float4) aligned loads.
+// TF32 TensorOp — large tiles (128x128x16) for high-throughput problems
 // ---------------------------------------------------------------------------
 
 using EpilogueOpTF32 = cutlass::epilogue::thread::LinearCombination<
     ElementOutput, 4, ElementAccumulator, ElementCompute>;
 
-using Conv2dKernelTF32 = typename cutlass::conv::kernel::DefaultConv2dFprop<
+using Conv2dKernelTF32Large = typename cutlass::conv::kernel::DefaultConv2dFprop<
     ElementInput, LayoutNHWC,
     ElementInput, LayoutNHWC,
     ElementOutput, LayoutNHWC,
     ElementAccumulator,
-    cutlass::arch::OpClassTensorOp,           // Tensor cores
+    cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
     cutlass::gemm::GemmShape<128, 128, 16>,   // Threadblock
     cutlass::gemm::GemmShape<64, 64, 16>,     // Warp
-    cutlass::gemm::GemmShape<16, 8, 8>,       // TF32 MMA instruction
+    cutlass::gemm::GemmShape<16, 8, 8>,       // TF32 MMA
     EpilogueOpTF32,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    3,                                        // Pipeline stages
-    cutlass::arch::OpMultiplyAdd,             // 1xTF32
+    3,
+    cutlass::arch::OpMultiplyAdd,
     cutlass::conv::IteratorAlgorithm::kOptimized
 >::Kernel;
 
-using ImplicitGemmTF32 = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernelTF32>;
+using ImplicitGemmTF32Large = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernelTF32Large>;
 
 // ---------------------------------------------------------------------------
-// SIMT fallback path (no alignment requirements)
-// For convolutions with C_in or C_out not divisible by 4.
+// TF32 TensorOp — small tiles (64x64x16) for small-T problems
+// More CTAs = better SM occupancy when output matrix is small.
+// ---------------------------------------------------------------------------
+
+using Conv2dKernelTF32Small = typename cutlass::conv::kernel::DefaultConv2dFprop<
+    ElementInput, LayoutNHWC,
+    ElementInput, LayoutNHWC,
+    ElementOutput, LayoutNHWC,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 64, 16>,     // Threadblock (4x more CTAs)
+    cutlass::gemm::GemmShape<32, 32, 16>,     // Warp
+    cutlass::gemm::GemmShape<16, 8, 8>,       // TF32 MMA
+    EpilogueOpTF32,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3,
+    cutlass::arch::OpMultiplyAdd,
+    cutlass::conv::IteratorAlgorithm::kOptimized
+>::Kernel;
+
+using ImplicitGemmTF32Small = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernelTF32Small>;
+
+// ---------------------------------------------------------------------------
+// SIMT fallback (no alignment requirements)
 // ---------------------------------------------------------------------------
 
 using EpilogueOpSIMT = cutlass::epilogue::thread::LinearCombination<
@@ -68,14 +90,14 @@ using Conv2dKernelSIMT = typename cutlass::conv::kernel::DefaultConv2dFprop<
     ElementInput, LayoutNHWC,
     ElementOutput, LayoutNHWC,
     ElementAccumulator,
-    cutlass::arch::OpClassSimt,               // CUDA cores
+    cutlass::arch::OpClassSimt,
     cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<128, 128, 8>,    // Threadblock
-    cutlass::gemm::GemmShape<32, 64, 8>,      // Warp
-    cutlass::gemm::GemmShape<1, 1, 1>,        // Scalar instruction
+    cutlass::gemm::GemmShape<128, 128, 8>,
+    cutlass::gemm::GemmShape<32, 64, 8>,
+    cutlass::gemm::GemmShape<1, 1, 1>,
     EpilogueOpSIMT,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    4,                                        // Pipeline stages
+    4,
     cutlass::arch::OpMultiplyAdd,
     cutlass::conv::IteratorAlgorithm::kOptimized
 >::Kernel;
@@ -105,7 +127,8 @@ struct ConvKeyHash {
     }
 };
 
-static std::unordered_map<ConvKey, ImplicitGemmTF32, ConvKeyHash> s_tf32_cache;
+static std::unordered_map<ConvKey, ImplicitGemmTF32Large, ConvKeyHash> s_tf32_large_cache;
+static std::unordered_map<ConvKey, ImplicitGemmTF32Small, ConvKeyHash> s_tf32_small_cache;
 static std::unordered_map<ConvKey, ImplicitGemmSIMT, ConvKeyHash> s_simt_cache;
 
 // ---------------------------------------------------------------------------
@@ -138,7 +161,7 @@ void cutlass_reshape_weights(const float* src, float* dst,
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build Arguments struct for a conv1d problem
+// Helper: build Conv2dProblemSize
 // ---------------------------------------------------------------------------
 
 static cutlass::conv::Conv2dProblemSize make_problem(
@@ -156,7 +179,7 @@ static cutlass::conv::Conv2dProblemSize make_problem(
 }
 
 // ---------------------------------------------------------------------------
-// Templated dispatch: try cache hit → update, else initialize → cache
+// Templated dispatch: cache hit → update, else initialize → cache
 // ---------------------------------------------------------------------------
 
 template <typename GemmOp, typename CacheMap>
@@ -204,8 +227,12 @@ static int dispatch_conv(CacheMap& cache,
 
 // ---------------------------------------------------------------------------
 // cutlass_conv1d_fprop: Conv1d forward via Cutlass Conv2d (H=1)
-//   Tries TF32 TensorOp first (C_in, C_out must be ÷4), falls back to SIMT.
+//
+// Tile selection: compute CTA count for 128x128 tile. If < SM_COUNT,
+// use 64x64 tiles for better occupancy on small problems.
 // ---------------------------------------------------------------------------
+
+static constexpr int SM_COUNT = 70;  // RTX 5070 Ti
 
 extern "C"
 int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
@@ -229,14 +256,30 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
     auto problem = make_problem(C_in, C_out, T_in, K, stride, padding, dilation);
     ConvKey key{C_in, C_out, T_in, K, stride, padding, dilation};
 
-    // Try TF32 TensorOp for aligned channels (÷4)
+    // TF32 path for aligned channels
     if ((C_in % 4 == 0) && (C_out % 4 == 0)) {
-        int rc = dispatch_conv<ImplicitGemmTF32>(
-            s_tf32_cache, key, problem,
-            x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
-            C_in, C_out, T_in, T_out, K, alpha, beta,
-            layout_x, layout_w, layout_y, layout_bias, stream);
-        if (rc == 0) return 0;
+        // Choose tile size based on CTA count with large tile
+        int ctas_large = ((C_out + 127) / 128) * ((T_out + 127) / 128);
+
+        if (ctas_large >= SM_COUNT) {
+            // Large tile: high per-CTA throughput, enough CTAs for full occupancy
+            int rc = dispatch_conv<ImplicitGemmTF32Large>(
+                s_tf32_large_cache, key, problem,
+                x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+                C_in, C_out, T_in, T_out, K, alpha, beta,
+                layout_x, layout_w, layout_y, layout_bias, stream);
+            if (rc == 0) return 0;
+        }
+
+        // Small tile: more CTAs for better SM occupancy on small problems
+        {
+            int rc = dispatch_conv<ImplicitGemmTF32Small>(
+                s_tf32_small_cache, key, problem,
+                x_nc, w_nc, bias_ptr, y, workspace, workspace_bytes,
+                C_in, C_out, T_in, T_out, K, alpha, beta,
+                layout_x, layout_w, layout_y, layout_bias, stream);
+            if (rc == 0) return 0;
+        }
     }
 
     // SIMT fallback
@@ -248,7 +291,7 @@ int cutlass_conv1d_fprop(const float* x, const float* w, const float* bias,
 }
 
 // ---------------------------------------------------------------------------
-// Query workspace size for a given conv configuration
+// Query workspace size
 // ---------------------------------------------------------------------------
 
 extern "C"
@@ -263,26 +306,25 @@ size_t cutlass_conv1d_workspace_bytes(int C_in, int C_out, int T_in, int K,
     LayoutNHWC layout_w = LayoutNHWC::packed({C_out, 1, K, C_in});
     LayoutNHWC layout_y = LayoutNHWC::packed({1, 1, T_out, C_out});
 
-    // TF32 and SIMT may need different workspace sizes — return the max
     size_t ws = 0;
+    auto check_ws = [&](auto& op, auto& args) {
+        size_t w2 = op.get_workspace_size(args);
+        if (w2 > ws) ws = w2;
+    };
+
     if ((C_in % 4 == 0) && (C_out % 4 == 0)) {
-        typename ImplicitGemmTF32::Arguments args(
-            problem,
-            {np, layout_x}, {np, layout_w},
-            {np, LayoutNHWC::Stride(0)}, {np, layout_y},
-            {1.0f, 0.0f});
-        ImplicitGemmTF32 tmp;
-        ws = tmp.get_workspace_size(args);
+        typename ImplicitGemmTF32Large::Arguments args(problem,
+            {np, layout_x}, {np, layout_w}, {np, LayoutNHWC::Stride(0)}, {np, layout_y}, {1.0f, 0.0f});
+        ImplicitGemmTF32Large tmp; check_ws(tmp, args);
+
+        typename ImplicitGemmTF32Small::Arguments args2(problem,
+            {np, layout_x}, {np, layout_w}, {np, LayoutNHWC::Stride(0)}, {np, layout_y}, {1.0f, 0.0f});
+        ImplicitGemmTF32Small tmp2; check_ws(tmp2, args2);
     }
     {
-        typename ImplicitGemmSIMT::Arguments args(
-            problem,
-            {np, layout_x}, {np, layout_w},
-            {np, LayoutNHWC::Stride(0)}, {np, layout_y},
-            {1.0f, 0.0f});
-        ImplicitGemmSIMT tmp;
-        size_t ws2 = tmp.get_workspace_size(args);
-        if (ws2 > ws) ws = ws2;
+        typename ImplicitGemmSIMT::Arguments args(problem,
+            {np, layout_x}, {np, layout_w}, {np, LayoutNHWC::Stride(0)}, {np, layout_y}, {1.0f, 0.0f});
+        ImplicitGemmSIMT tmp; check_ws(tmp, args);
     }
     return ws;
 }

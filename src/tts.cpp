@@ -131,7 +131,6 @@ static void gemm_conv1d(cublasHandle_t cublas,
     int CK = C_in * K;
 
     // Try Cutlass implicit GEMM for large convolutions (needs NHWC weights, K>1)
-    // Only beneficial when the problem is large enough to amortize launch overhead.
     if (K > 1) {
         auto it = s_w_nhwc.find(w);
         if (it != s_w_nhwc.end()) {
