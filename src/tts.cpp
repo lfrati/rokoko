@@ -31,6 +31,10 @@ extern "C" int cutlass_gemm_nn(int M, int N, int K,
     const float* A, int lda, const float* B, int ldb,
     float* C, int ldc, float alpha, float beta,
     float* workspace, size_t workspace_bytes, cudaStream_t stream);
+extern "C" int cutlass_gemm_tn_bias(int M, int N, int K,
+    const float* A, int lda, const float* B, int ldb,
+    float* D, int ldd, const float* bias,
+    float* workspace, size_t workspace_bytes, cudaStream_t stream);
 extern "C" int cutlass_gemm_batched_tn(int M, int N, int K,
     const float* A, int lda, long long strideA,
     const float* B, int ldb, long long strideB,
@@ -90,16 +94,15 @@ static void sgemm_nn(int m, int n, int k,
                      alpha, beta, s_workspace, s_workspace_bytes, stream);
 }
 
-// C = alpha * A^T * B + bias + beta * C  (GEMM + separate bias add)
+// C = A^T * B + bias  (fused into Cutlass epilogue via stride-0 C source)
 static void sgemm_bias(int m, int n, int k,
                         const float* A, int lda,
                         const float* B, int ldb,
                         float* C, int ldc,
                         const float* bias,
                         cudaStream_t stream) {
-    cutlass_gemm_tn(m, n, k, A, lda, B, ldb, C, ldc,
-                     1.0f, 0.0f, s_workspace, s_workspace_bytes, stream);
-    channel_bias_add_f32(C, bias, m, n, stream);
+    cutlass_gemm_tn_bias(m, n, k, A, lda, B, ldb, C, ldc, bias,
+                          s_workspace, s_workspace_bytes, stream);
 }
 
 // ---------------------------------------------------------------------------

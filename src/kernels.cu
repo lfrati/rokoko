@@ -1290,48 +1290,43 @@ void fused_lstm_f32(const float* Whh, const float* ig_all,
 //   One warp per output element, warp-shuffle reduction over K.
 // ---------------------------------------------------------------------------
 
+// GEMV: y[M] = alpha * A[K,M]^T * x[K] + beta * y[M]
+// A is col-major [K, M] with leading dim lda. One warp per output row,
+// multiple rows per block for better occupancy. Each warp reduces over K.
+static constexpr int GEMV_ROWS_PER_BLOCK = 8;  // 8 warps = 256 threads
+
 __global__ void gemv_tn_kernel(const float* __restrict__ A, int lda,
                                 const float* __restrict__ x,
                                 float* __restrict__ y,
                                 int M, int K, float alpha, float beta) {
-    int m = blockIdx.x;
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x & 31;
+    int m = blockIdx.x * GEMV_ROWS_PER_BLOCK + warp_id;
     if (m >= M) return;
 
     // Column m of A (col-major): A[k, m] = A[k + m * lda]
     const float* col = A + (long long)m * lda;
 
-    // Parallel reduction over K using all threads in the block
+    // Warp-parallel reduction over K
     float sum = 0.0f;
-    for (int k = threadIdx.x; k < K; k += blockDim.x)
+    for (int k = lane; k < K; k += 32)
         sum += col[k] * x[k];
 
-    // Warp-level reduction
+    // Warp shuffle reduction
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
 
-    // Cross-warp reduction via shared memory
-    __shared__ float warp_sums[8];  // up to 256 threads = 8 warps
-    int warp = threadIdx.x / 32;
-    int lane = threadIdx.x & 31;
-    if (lane == 0) warp_sums[warp] = sum;
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        int n_warps = (blockDim.x + 31) / 32;
-        for (int w = 0; w < n_warps; w++)
-            total += warp_sums[w];
-        y[m] = alpha * total + beta * y[m];
-    }
+    if (lane == 0)
+        y[m] = alpha * sum + beta * y[m];
 }
 
 void gemv_tn_f32(const float* A, int lda, const float* x,
                   float* y, int M, int K,
                   float alpha, float beta,
                   cudaStream_t stream) {
-    // Use enough threads to cover K with good occupancy
-    int threads = (K <= 32) ? 32 : (K <= 64) ? 64 : (K <= 128) ? 128 : 256;
-    gemv_tn_kernel<<<M, threads, 0, stream>>>(A, lda, x, y, M, K, alpha, beta);
+    int blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    gemv_tn_kernel<<<blocks, GEMV_ROWS_PER_BLOCK * 32, 0, stream>>>(
+        A, lda, x, y, M, K, alpha, beta);
 }
 
 // ---------------------------------------------------------------------------

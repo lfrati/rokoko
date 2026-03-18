@@ -435,6 +435,55 @@ int cutlass_gemm_nn(int M, int N, int K,
 }
 
 // ---------------------------------------------------------------------------
+// cutlass_gemm_tn_bias: D = A^T * B + bias  (bias broadcast across columns)
+//   bias: [M] vector, fused into epilogue via stride-0 C source.
+//   Same as cutlass_gemm_tn but with separate C (bias) and D (output).
+// ---------------------------------------------------------------------------
+
+extern "C"
+int cutlass_gemm_tn_bias(int M, int N, int K,
+                          const float* A, int lda,
+                          const float* B, int ldb,
+                          float* D, int ldd,
+                          const float* bias,
+                          float* workspace, size_t workspace_bytes,
+                          cudaStream_t stream) {
+    cutlass::gemm::GemmCoord problem(M, N, K);
+    // Use ldd=0 in key to distinguish bias-fused from regular GEMM
+    GemmKey key{M, N, K, lda, ldb, -(ldd + 1)};
+
+    if (tf32_align4(M, K)) {
+        int ctas = ((M + 127) / 128) * ((N + 127) / 128);
+        if (ctas >= SM_COUNT) {
+            typename GemmTN_TF32_Large::Arguments args(problem,
+                {(const Element*)A, LayoutRM(lda)}, {(const Element*)B, LayoutCM(ldb)},
+                {const_cast<Element*>(bias), LayoutCM(0)},
+                {D, LayoutCM(ldd)}, {1.0f, 1.0f});
+            if (dispatch_gemm<GemmTN_TF32_Large>(s_tn_large, key, args, workspace, workspace_bytes, stream) == 0) return 0;
+        }
+        {
+            typename GemmTN_TF32_Small::Arguments args(problem,
+                {(const Element*)A, LayoutRM(lda)}, {(const Element*)B, LayoutCM(ldb)},
+                {const_cast<Element*>(bias), LayoutCM(0)},
+                {D, LayoutCM(ldd)}, {1.0f, 1.0f});
+            if (dispatch_gemm<GemmTN_TF32_Small>(s_tn_small, key, args, workspace, workspace_bytes, stream) == 0) return 0;
+        }
+    }
+    if (tf32_align1(K)) {
+        typename GemmTN_TF32_Align1::Arguments args(problem,
+            {(const Element*)A, LayoutRM(lda)}, {(const Element*)B, LayoutCM(ldb)},
+            {const_cast<Element*>(bias), LayoutCM(0)},
+            {D, LayoutCM(ldd)}, {1.0f, 1.0f});
+        if (dispatch_gemm<GemmTN_TF32_Align1>(s_tn_align1, key, args, workspace, workspace_bytes, stream) == 0) return 0;
+    }
+    typename GemmTN_SIMT::Arguments args(problem,
+        {(const Element*)A, LayoutRM(lda)}, {(const Element*)B, LayoutCM(ldb)},
+        {const_cast<Element*>(bias), LayoutCM(0)},
+        {D, LayoutCM(ldd)}, {1.0f, 1.0f});
+    return dispatch_gemm<GemmTN_SIMT>(s_tn_simt, key, args, workspace, workspace_bytes, stream);
+}
+
+// ---------------------------------------------------------------------------
 // cutlass_gemm_batched_tn: C_i = alpha * A_i^T * B_i + beta * C_i
 // ---------------------------------------------------------------------------
 
