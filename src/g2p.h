@@ -675,7 +675,7 @@ inline bool G2PModelCuda::load_from_file_(FILE* f, const char* label, cudaStream
 }
 
 inline void G2PModelCuda::free() {
-    for (auto& [t, exec] : graph_cache_) cudaGraphExecDestroy(exec);
+    for (auto& [t, exec] : graph_cache_) if (exec) cudaGraphExecDestroy(exec);
     graph_cache_.clear();
     if (weights_gpu_) { cudaFree(weights_gpu_); weights_gpu_ = nullptr; }
     if (workspace_) { cudaFree(workspace_); workspace_ = nullptr; workspace_bytes_ = 0; }
@@ -839,16 +839,17 @@ inline std::string G2PModelCuda::infer(const std::string& text,
 
     };
 
-    // CUDA graph: capture all kernel launches on first call per T,
-    // replay as single graph launch on subsequent calls.
+    // CUDA graph: first call runs directly (populates Cutlass operator caches),
+    // second call captures the graph, third+ replays.
     auto git = graph_cache_.find(T);
     if (git == graph_cache_.end()) {
-        // Warm-up pass: run once without graph capture to populate Cutlass
-        // operator caches (initialize() cannot run during graph capture).
+        // First call: run directly. Cutlass initialize() populates operator
+        // caches. Output is valid — returned to caller.
         run_kernels();
-        cudaStreamSynchronize(stream);
-
-        // Now capture — all Cutlass operators hit cache (update + operator only)
+        // Mark as "seen but not yet captured" with nullptr
+        graph_cache_[T] = nullptr;
+    } else if (git->second == nullptr) {
+        // Second call: capture graph (all Cutlass operators hit cache)
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
         run_kernels();
         cudaGraph_t graph;
@@ -856,9 +857,10 @@ inline std::string G2PModelCuda::infer(const std::string& text,
         cudaGraphExec_t exec;
         cudaGraphInstantiateWithFlags(&exec, graph, 0);
         cudaGraphDestroy(graph);
-        graph_cache_[T] = exec;
+        git->second = exec;
         cudaGraphLaunch(exec, stream);
     } else {
+        // Third+: replay cached graph
         cudaGraphLaunch(git->second, stream);
     }
 
