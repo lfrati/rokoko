@@ -346,8 +346,8 @@ Weights Weights::prefetch(const std::string& path) {
 
     uint32_t version;
     memcpy(&version, base + 4, 4);
-    if (version != KOKO_VERSION) {
-        fprintf(stderr, "Unsupported weight file version %u (expected %u)\n", version, KOKO_VERSION);
+    if (version != 1 && version != 2) {
+        fprintf(stderr, "Unsupported weight file version %u (expected 1 or 2)\n", version);
         munmap(mapped, file_size);
         std::exit(1);
     }
@@ -373,6 +373,7 @@ Weights Weights::prefetch(const std::string& path) {
     }
 
     w.gpu_data_size = total_data;
+    w.version = version;
     w.prefetch_base = (const uint8_t*)mapped + data_start;
     w.mmap_ptr = mapped;
     w.mmap_size = file_size;
@@ -399,8 +400,8 @@ Weights Weights::prefetch(const void* data, size_t size) {
 
     uint32_t version;
     memcpy(&version, base + 4, 4);
-    if (version != KOKO_VERSION) {
-        fprintf(stderr, "Unsupported weight file version %u (expected %u)\n", version, KOKO_VERSION);
+    if (version != 1 && version != 2) {
+        fprintf(stderr, "Unsupported weight file version %u (expected 1 or 2)\n", version);
         std::exit(1);
     }
 
@@ -425,6 +426,7 @@ Weights Weights::prefetch(const void* data, size_t size) {
     }
 
     w.gpu_data_size = total_data;
+    w.version = version;
     w.prefetch_base = base + data_start;
     // mmap_ptr stays nullptr — we don't own the mapping
     return w;

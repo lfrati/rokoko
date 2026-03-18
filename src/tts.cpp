@@ -204,6 +204,17 @@ static std::unordered_map<const float*, __half*> s_w_nhwc_f16;  // FP16 NHWC
 static std::unordered_map<const float*, std::pair<__half*, int>> s_w_nhwc_f16_padded;
 
 // ---------------------------------------------------------------------------
+// Derived tensor tracking (for v2 export)
+// ---------------------------------------------------------------------------
+struct DerivedTensor {
+    std::string name;     // e.g., "foo.f16", "foo.nhwc", "foo.nhwc_f16", "foo.nhwc_f16_pad520"
+    const void* gpu_ptr;  // pointer to GPU data
+    size_t size_bytes;    // total bytes
+    std::string dtype;    // "float32" or "float16"
+};
+static std::vector<DerivedTensor> s_derived_tensors;
+
+// ---------------------------------------------------------------------------
 // Conv1d forward: Cutlass implicit GEMM (w_nhwc), falls back to im2col + GEMM.
 // ---------------------------------------------------------------------------
 
@@ -1483,7 +1494,96 @@ std::vector<float> rokoko_infer(const Weights& w,
 // and weight_norm_f32 calls in inference can be skipped.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Populate static maps from v2 file (pre-baked FP16/NHWC tensors)
+// ---------------------------------------------------------------------------
+
+static void populate_maps_from_v2(Weights& w) {
+    uint8_t* gpu_base = (uint8_t*)w.gpu_data;
+
+    // Build name→offset map for base tensors
+    for (auto& td : w.tensors) {
+        const std::string& name = td.name;
+
+        // FP16 linear weights: "foo.f16" → s_fp16_weights[ptr_to("foo")]
+        if (name.size() > 4 && name.substr(name.size()-4) == ".f16") {
+            std::string base = name.substr(0, name.size()-4);
+            auto it = w.name_to_idx.find(base);
+            if (it != w.name_to_idx.end()) {
+                const float* key = (const float*)(gpu_base + w.tensors[it->second].offset);
+                const __half* val = (const __half*)(gpu_base + td.offset);
+                s_fp16_weights[key] = val;
+            }
+        }
+        // NHWC FP32: "foo.nhwc"
+        else if (name.size() > 5 && name.substr(name.size()-5) == ".nhwc") {
+            std::string base = name.substr(0, name.size()-5);
+            auto it = w.name_to_idx.find(base);
+            if (it != w.name_to_idx.end()) {
+                const float* key = (const float*)(gpu_base + w.tensors[it->second].offset);
+                float* val = (float*)(gpu_base + td.offset);
+                s_w_nhwc[key] = val;
+            }
+        }
+        // NHWC FP16: "foo.nhwc_f16"
+        else if (name.size() > 9 && name.substr(name.size()-9) == ".nhwc_f16") {
+            std::string base = name.substr(0, name.size()-9);
+            auto it = w.name_to_idx.find(base);
+            if (it != w.name_to_idx.end()) {
+                const float* key = (const float*)(gpu_base + w.tensors[it->second].offset);
+                __half* val = (__half*)(gpu_base + td.offset);
+                s_w_nhwc_f16[key] = val;
+            }
+        }
+        // Padded NHWC FP16: "foo.nhwc_f16_pad520" (number = C_in_pad)
+        else if (name.find(".nhwc_f16_pad") != std::string::npos) {
+            size_t pos = name.find(".nhwc_f16_pad");
+            std::string base = name.substr(0, pos);
+            int c_in_pad = std::stoi(name.substr(pos + 13));
+            auto it = w.name_to_idx.find(base);
+            if (it != w.name_to_idx.end()) {
+                const float* key = (const float*)(gpu_base + w.tensors[it->second].offset);
+                __half* val = (__half*)(gpu_base + td.offset);
+                s_w_nhwc_f16_padded[key] = {val, c_in_pad};
+            }
+        }
+    }
+
+    // LSTM precomputed biases: look for ".bias_combined_fwd" / ".bias_combined_rev"
+    auto lookup_bias = [&](const std::string& name) -> float* {
+        auto it = w.name_to_idx.find(name);
+        if (it == w.name_to_idx.end()) return nullptr;
+        return (float*)(gpu_base + w.tensors[it->second].offset);
+    };
+
+    w.text_lstm_bias_fwd = lookup_bias("text_encoder.lstm.bias_combined_fwd");
+    w.text_lstm_bias_rev = lookup_bias("text_encoder.lstm.bias_combined_rev");
+
+    for (int i = 0; i < 3; i++) {
+        std::string pfx = "predictor.text_encoder.lstms." + std::to_string(i);
+        w.dur_enc_lstm[i].bias_fwd = lookup_bias(pfx + ".bias_combined_fwd");
+        w.dur_enc_lstm[i].bias_rev = lookup_bias(pfx + ".bias_combined_rev");
+    }
+    w.dur_lstm.bias_fwd = lookup_bias("predictor.lstm.bias_combined_fwd");
+    w.dur_lstm.bias_rev = lookup_bias("predictor.lstm.bias_combined_rev");
+    w.shared_lstm.bias_fwd = lookup_bias("predictor.shared.bias_combined_fwd");
+    w.shared_lstm.bias_rev = lookup_bias("predictor.shared.bias_combined_rev");
+}
+
+// ---------------------------------------------------------------------------
+// Precompute all weight norms + derived tensors
+// ---------------------------------------------------------------------------
+
 void precompute_weight_norms(Weights& w, cudaStream_t stream) {
+    if (w.version == 2) {
+        populate_maps_from_v2(w);
+        // Allocate FP16 activation staging buffer (still needed for runtime casts)
+        s_fp16_buf_size = 16 * 1024 * 1024;
+        CUDA_CHECK(cudaMalloc(&s_fp16_buf, s_fp16_buf_size));
+        fprintf(stderr, "  FP16 weights: loaded pre-baked v2 (%zu linear, %zu nhwc_f16, %zu padded)\n",
+                s_fp16_weights.size(), s_w_nhwc_f16.size(), s_w_nhwc_f16_padded.size());
+        return;
+    }
     auto wn = [&](float* wg, float* wv, int C_out, int fan_in) {
         weight_norm_f32(wg, wv, wv, C_out, fan_in, stream);  // in-place
     };
@@ -1571,13 +1671,30 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
     // Generator: conv_post (128→22, k=7)
     wn(w.gen_conv_post_wg, w.gen_conv_post_wv, 22, 128 * 7);
 
+    // ---- Build reverse map: GPU pointer → tensor name (for v2 export tracking) ----
+    s_derived_tensors.clear();
+    std::unordered_map<const void*, std::string> ptr_to_name;
+    {
+        uint8_t* gpu_base = (uint8_t*)w.gpu_data;
+        for (auto& td : w.tensors)
+            ptr_to_name[(const void*)(gpu_base + td.offset)] = td.name;
+    }
+    auto name_of = [&](const void* ptr) -> std::string {
+        auto it = ptr_to_name.find(ptr);
+        return (it != ptr_to_name.end()) ? it->second : "unknown";
+    };
+
     // Precompute LSTM biases: bias = bih + bhh for each direction
-    auto precompute_lstm_bias = [&](Weights::BiLSTMWeights& lw, int H) {
+    auto precompute_lstm_bias = [&](Weights::BiLSTMWeights& lw, int H,
+                                     const std::string& prefix) {
         int G = 4 * H;
-        CUDA_CHECK(cudaMalloc(&lw.bias_fwd, G * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&lw.bias_rev, G * sizeof(float)));
+        size_t bytes = G * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&lw.bias_fwd, bytes));
+        CUDA_CHECK(cudaMalloc(&lw.bias_rev, bytes));
         add_f32(lw.bih_fwd, lw.bhh_fwd, lw.bias_fwd, G, stream);
         add_f32(lw.bih_rev, lw.bhh_rev, lw.bias_rev, G, stream);
+        s_derived_tensors.push_back({prefix + ".bias_combined_fwd", lw.bias_fwd, bytes, "float32"});
+        s_derived_tensors.push_back({prefix + ".bias_combined_rev", lw.bias_rev, bytes, "float32"});
     };
 
     // Text encoder LSTM (H=256)
@@ -1585,27 +1702,35 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
     {
         w.text_lstm_bias_fwd = nullptr;
         w.text_lstm_bias_rev = nullptr;
-        CUDA_CHECK(cudaMalloc(&w.text_lstm_bias_fwd, 1024 * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&w.text_lstm_bias_rev, 1024 * sizeof(float)));
+        size_t bytes = 1024 * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&w.text_lstm_bias_fwd, bytes));
+        CUDA_CHECK(cudaMalloc(&w.text_lstm_bias_rev, bytes));
         add_f32(w.text_lstm_bih_fwd, w.text_lstm_bhh_fwd, w.text_lstm_bias_fwd, 1024, stream);
         add_f32(w.text_lstm_bih_rev, w.text_lstm_bhh_rev, w.text_lstm_bias_rev, 1024, stream);
+        s_derived_tensors.push_back({"text_encoder.lstm.bias_combined_fwd",
+                                     w.text_lstm_bias_fwd, bytes, "float32"});
+        s_derived_tensors.push_back({"text_encoder.lstm.bias_combined_rev",
+                                     w.text_lstm_bias_rev, bytes, "float32"});
     }
 
     // Prosody predictor LSTMs
     for (int i = 0; i < 3; i++)
-        precompute_lstm_bias(w.dur_enc_lstm[i], 256);
-    precompute_lstm_bias(w.dur_lstm, 256);
-    precompute_lstm_bias(w.shared_lstm, 256);
+        precompute_lstm_bias(w.dur_enc_lstm[i], 256,
+                             "predictor.text_encoder.lstms." + std::to_string(i));
+    precompute_lstm_bias(w.dur_lstm, 256, "predictor.lstm");
+    precompute_lstm_bias(w.shared_lstm, 256, "predictor.shared");
 
     // ---- Precompute NHWC weights for Cutlass implicit GEMM ----
     // Reshape [C_out, C_in, K] → [C_out, K, C_in] for Conv1d weights with K>1.
     // K=1 convolutions are just GEMMs and don't benefit from implicit GEMM.
     auto make_nhwc = [&](float* wv, int C_out, int C_in, int K) {
         if (K <= 1) return;
+        size_t bytes = (size_t)C_out * C_in * K * sizeof(float);
         float* w_nhwc = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_nhwc, (size_t)C_out * C_in * K * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&w_nhwc, bytes));
         cutlass_reshape_weights(wv, w_nhwc, C_out, C_in, K, stream);
         s_w_nhwc[wv] = w_nhwc;
+        s_derived_tensors.push_back({name_of(wv) + ".nhwc", w_nhwc, bytes, "float32"});
     };
 
     // Text encoder conv blocks (K=5)
@@ -1673,20 +1798,24 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
 
     auto make_fp16 = [&](const float* w_ptr, size_t n_elements) {
         if (!w_ptr || n_elements == 0) return;
+        size_t bytes = n_elements * sizeof(__half);
         __half* w_f16 = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_f16, n_elements * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&w_f16, bytes));
         cast_f32_to_f16(w_ptr, w_f16, (int)n_elements, stream);
         s_fp16_weights[w_ptr] = w_f16;
+        s_derived_tensors.push_back({name_of(w_ptr) + ".f16", w_f16, bytes, "float16"});
     };
 
     // NHWC FP16 for Cutlass conv (reshape + cast in one kernel)
     auto make_nhwc_f16 = [&](float* wv, int C_out, int C_in, int K) {
         if (K <= 1) return;
         if (C_in % 8 != 0 || C_out % 4 != 0) return;  // alignment required
+        size_t bytes = (size_t)C_out * C_in * K * sizeof(__half);
         __half* w_f16 = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_f16, (size_t)C_out * C_in * K * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&w_f16, bytes));
         cutlass_reshape_weights_f16(wv, w_f16, C_out, C_in, K, stream);
         s_w_nhwc_f16[wv] = w_f16;
+        s_derived_tensors.push_back({name_of(wv) + ".nhwc_f16", w_f16, bytes, "float16"});
     };
 
     // Padded NHWC FP16 for conv weights with unaligned C_in.
@@ -1701,11 +1830,14 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
         CUDA_CHECK(cudaMalloc(&w_padded, (size_t)C_out * C_in_pad * K * sizeof(float)));
         pad_blocks_f32(wv, w_padded, C_out, C_in * K, C_in_pad * K, stream);
         // Reshape padded weight to NHWC and cast to FP16
+        size_t bytes = (size_t)C_out * C_in_pad * K * sizeof(__half);
         __half* w_f16 = nullptr;
-        CUDA_CHECK(cudaMalloc(&w_f16, (size_t)C_out * C_in_pad * K * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&w_f16, bytes));
         cutlass_reshape_weights_f16(w_padded, w_f16, C_out, C_in_pad, K, stream);
         cudaFree(w_padded);  // temp
         s_w_nhwc_f16_padded[wv] = {w_f16, C_in_pad};
+        s_derived_tensors.push_back({name_of(wv) + ".nhwc_f16_pad" + std::to_string(C_in_pad),
+                                     w_f16, bytes, "float16"});
     };
 
     // ALBERT linear weights
@@ -1847,11 +1979,145 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
     cudaStreamSynchronize(stream);
 
     fprintf(stderr, "  FP16 weights: %zu matrices converted, %.1f MB\n",
-            s_fp16_weights.size(),
-            [&]() {
-                size_t total = 0;
-                for (auto& [k, v] : s_fp16_weights) { (void)k; (void)v; total++; }
-                // Rough estimate: average 0.5M params * 2 bytes = 1 MB per entry
-                return s_fp16_weights.size() * 0.5;  // placeholder
-            }());
+            s_fp16_weights.size(), s_fp16_weights.size() * 0.5);
+    fprintf(stderr, "  Derived tensors tracked: %zu (for v2 export)\n",
+            s_derived_tensors.size());
+}
+
+// ---------------------------------------------------------------------------
+// Export KOKO v2: write all base tensors (post-weight-norm FP32) + derived
+// tensors (FP16, NHWC, LSTM biases) into a single contiguous KOKO file.
+// ---------------------------------------------------------------------------
+
+static size_t align_up_export(size_t x, size_t alignment) {
+    return (x + alignment - 1) & ~(alignment - 1);
+}
+
+void export_koko_v2(const Weights& w, const std::string& path, cudaStream_t stream) {
+    fprintf(stderr, "Exporting KOKO v2 to %s ...\n", path.c_str());
+
+    // Step 1: Download base FP32 data from GPU
+    std::vector<uint8_t> base_data(w.gpu_data_size);
+    CUDA_CHECK(cudaMemcpy(base_data.data(), w.gpu_data, w.gpu_data_size,
+                           cudaMemcpyDeviceToHost));
+    cudaStreamSynchronize(stream);
+
+    // Step 2: Download each derived tensor from GPU
+    struct DerivedBlob {
+        std::string name;
+        std::vector<uint8_t> data;
+        std::string dtype;
+    };
+    std::vector<DerivedBlob> derived_blobs;
+    derived_blobs.reserve(s_derived_tensors.size());
+
+    for (auto& dt : s_derived_tensors) {
+        DerivedBlob blob;
+        blob.name = dt.name;
+        blob.dtype = dt.dtype;
+        blob.data.resize(dt.size_bytes);
+        CUDA_CHECK(cudaMemcpy(blob.data.data(), dt.gpu_ptr, dt.size_bytes,
+                               cudaMemcpyDeviceToHost));
+        derived_blobs.push_back(std::move(blob));
+    }
+    cudaStreamSynchronize(stream);
+
+    fprintf(stderr, "  Downloaded %zu base tensors + %zu derived tensors from GPU\n",
+            w.tensors.size(), derived_blobs.size());
+
+    // Step 3: Layout all tensors in one contiguous data blob.
+    // Base tensors keep their original offsets (already 256-aligned from v1).
+    // Derived tensors are appended after the base data.
+    size_t data_cursor = align_up_export(w.gpu_data_size, 256);
+
+    struct TensorEntry {
+        std::string name;
+        size_t offset;
+        size_t size_bytes;
+        std::string dtype;
+    };
+    std::vector<TensorEntry> all_entries;
+    all_entries.reserve(w.tensors.size() + derived_blobs.size());
+
+    // Base tensors (same offsets as v1)
+    for (auto& td : w.tensors) {
+        all_entries.push_back({td.name, td.offset, td.size_bytes, td.dtype});
+    }
+
+    // Derived tensors (appended with 256-byte alignment)
+    std::vector<size_t> derived_offsets;
+    for (auto& db : derived_blobs) {
+        data_cursor = align_up_export(data_cursor, 256);
+        derived_offsets.push_back(data_cursor);
+        all_entries.push_back({db.name, data_cursor, db.data.size(), db.dtype});
+        data_cursor += db.data.size();
+    }
+    size_t total_data_size = data_cursor;
+
+    // Step 4: Build header text
+    std::string header_text;
+    for (auto& e : all_entries) {
+        header_text += e.name + " " + std::to_string(e.offset) + " "
+                     + std::to_string(e.size_bytes) + " " + e.dtype + "\n";
+    }
+
+    // Step 5: Compute file layout
+    // [magic:4][version:4][header_len:8][header_text][padding to 4096][data blob]
+    uint32_t magic = KOKO_MAGIC;
+    uint32_t version = 2;
+    uint64_t header_len = header_text.size();
+    size_t header_end = 16 + header_len;
+    size_t data_start = align_up_export(header_end, HEADER_ALIGN);
+    size_t file_size = data_start + total_data_size;
+
+    // Step 6: Write file
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open %s for writing\n", path.c_str());
+        return;
+    }
+
+    // Write header
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(&header_len, 8, 1, f);
+    fwrite(header_text.data(), 1, header_text.size(), f);
+
+    // Pad to data_start
+    size_t pad_bytes = data_start - header_end;
+    if (pad_bytes > 0) {
+        std::vector<uint8_t> zeros(pad_bytes, 0);
+        fwrite(zeros.data(), 1, pad_bytes, f);
+    }
+
+    // Write base data blob (with zero-fill for alignment gaps if needed)
+    fwrite(base_data.data(), 1, w.gpu_data_size, f);
+
+    // Zero-fill gap between base data and first derived tensor
+    size_t gap = align_up_export(w.gpu_data_size, 256) - w.gpu_data_size;
+    if (gap > 0) {
+        std::vector<uint8_t> zeros(gap, 0);
+        fwrite(zeros.data(), 1, gap, f);
+    }
+
+    // Write derived tensors with alignment padding
+    size_t write_cursor = align_up_export(w.gpu_data_size, 256);
+    for (size_t i = 0; i < derived_blobs.size(); i++) {
+        // Pad to derived_offsets[i]
+        if (write_cursor < derived_offsets[i]) {
+            size_t pad = derived_offsets[i] - write_cursor;
+            std::vector<uint8_t> zeros(pad, 0);
+            fwrite(zeros.data(), 1, pad, f);
+            write_cursor += pad;
+        }
+        fwrite(derived_blobs[i].data.data(), 1, derived_blobs[i].data.size(), f);
+        write_cursor += derived_blobs[i].data.size();
+    }
+
+    fclose(f);
+
+    fprintf(stderr, "  KOKO v2: %zu tensors (%zu base + %zu derived), %.1f MB file\n",
+            all_entries.size(), w.tensors.size(), derived_blobs.size(),
+            file_size / (1024.0 * 1024.0));
+    fprintf(stderr, "  Wrote %s\n", path.c_str());
 }

@@ -135,6 +135,7 @@ static constexpr int SAMPLE_RATE     = 24000;
 struct Weights {
     void* gpu_data = nullptr;        // single contiguous GPU allocation
     size_t gpu_data_size = 0;
+    uint32_t version = 1;            // KOKO file format version (1 or 2)
 
     // Prefetch state (temporary — cleared after upload)
     const void* prefetch_base = nullptr;  // points to KOKO data start
@@ -377,3 +378,6 @@ void write_wav_to_(std::ostream& f, const float* audio,
 
 /// Precompute weight norms (called once after weight upload).
 void precompute_weight_norms(Weights& w, cudaStream_t stream);
+
+/// Export a KOKO v2 weight file with pre-baked FP16/NHWC tensors.
+void export_koko_v2(const Weights& w, const std::string& path, cudaStream_t stream);

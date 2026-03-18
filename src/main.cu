@@ -392,6 +392,7 @@ int main(int argc, char** argv) {
             "  --serve [port]      HTTP server with web UI (default: 8080)\n"
             "  --host <addr>       Server bind address (default: 0.0.0.0)\n"
             "  --bundle <file>     Model bundle (default: ~/.cache/rokoko/rokoko.bundle)\n"
+            "  --export-fp16 <f>   Export KOKO v2 weight file and exit\n"
             "  --help              Show this help\n"
             "\n"
             "Examples:\n"
@@ -417,14 +418,18 @@ int main(int argc, char** argv) {
     bool serve_mode = false;
     int serve_port = 8080;
     std::string serve_host = "0.0.0.0";
+    std::string export_fp16_path;
+    std::string weights_path;  // standalone KOKO v2 weights file
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--bundle" && i + 1 < argc)       bundle_path = argv[++i];
+        else if (arg == "--weights" && i + 1 < argc)  weights_path = argv[++i];
         else if (arg == "--voice" && i + 1 < argc)   voice_name = argv[++i];
         else if (arg == "-o" && i + 1 < argc)        output_path = argv[++i];
         else if (arg == "--stdout")                   output_path = "-";
         else if (arg == "--host" && i + 1 < argc)    serve_host = argv[++i];
+        else if (arg == "--export-fp16" && i + 1 < argc) export_fp16_path = argv[++i];
         else if (arg == "--serve") {
             serve_mode = true;
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -439,8 +444,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!serve_mode && text_input.empty()) {
-        fprintf(stderr, "Error: provide text or use --serve for server mode\n");
+    if (!serve_mode && export_fp16_path.empty() && text_input.empty()) {
+        fprintf(stderr, "Error: provide text or use --serve/--export-fp16\n");
         return 1;
     }
 
@@ -506,7 +511,10 @@ int main(int argc, char** argv) {
     // --- Load TTS weights (prefetch in background) + init CUDA ---
     Weights prefetched;
     std::thread prefetch_thread([&]() {
-        prefetched = Weights::prefetch(weights_span.data, weights_span.size);
+        if (!weights_path.empty())
+            prefetched = Weights::prefetch(weights_path);
+        else
+            prefetched = Weights::prefetch(weights_span.data, weights_span.size);
     });
     cudaFree(0); // lazy CUDA init
     prefetch_thread.join();
@@ -515,6 +523,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaStreamCreate(&stream));
     prefetched.upload(stream);
     precompute_weight_norms(prefetched, stream);
+
+    // --- Export KOKO v2 if requested ---
+    if (!export_fp16_path.empty()) {
+        export_koko_v2(prefetched, export_fp16_path, stream);
+        prefetched.free();
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        return 0;
+    }
 
     // --- Load G2P model ---
     G2PModelCuda g2p;
