@@ -30,6 +30,10 @@
 #include "bundle.h"
 #include "server.h"
 
+// Backend-specific: each binary provides its own bundle URL + filename
+extern const char* default_bundle_url();
+extern const char* default_bundle_filename();
+
 // ---------------------------------------------------------------------------
 // Voice map (populated from bundle)
 // ---------------------------------------------------------------------------
@@ -411,7 +415,7 @@ int main(int argc, char** argv) {
     }
 
     std::string home = std::getenv("HOME") ? std::getenv("HOME") : ".";
-    std::string bundle_path = home + "/.cache/rokoko/rokoko.bundle";
+    std::string bundle_path = home + "/.cache/rokoko/" + default_bundle_filename();
     std::string weights_path;  // standalone .koko file (overrides bundle weights)
     std::string text_input;
     std::string voice_name = "af_heart";
@@ -464,8 +468,7 @@ int main(int argc, char** argv) {
 
             fprintf(stderr, "Bundle not found at %s — downloading...\n", bundle_path.c_str());
 
-            static const char* url =
-                "https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.bundle";
+            const char* url = default_bundle_url();
 
             // Download to temp file, then rename atomically
             std::string tmp_path = bundle_path + ".tmp";

@@ -270,8 +270,9 @@ struct Weights {
         // FP16 companions (v2)
         __half *conv1_wv_nhwc_f16 = nullptr;  // NHWC FP16 for K=3 conv
         __half *conv2_wv_nhwc_f16 = nullptr;
-        __half *conv1x1_wv_f16 = nullptr;     // K=1, straight FP16
-        int conv1_c_in_pad = 0;               // padded C_in (0 = unpadded)
+        __half *conv1x1_wv_nhwc_f16 = nullptr; // K=1 NHWC FP16 (identity layout)
+        int conv1_c_in_pad = 0;               // padded C_in for conv1 (0 = unpadded)
+        int conv1x1_c_in_pad = 0;             // padded C_in for conv1x1 (0 = unpadded)
     };
 
     // DurationEncoder: 3x (BiLSTM + AdaLayerNorm)

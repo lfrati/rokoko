@@ -424,8 +424,10 @@ void Weights::assign_v2_fp16_pointers() {
         blk.conv1_wv_nhwc_f16 = nhwc16(c1);
         blk.conv1_c_in_pad = pad_cin(c1);
         blk.conv2_wv_nhwc_f16 = nhwc16(c2);
-        if (blk.has_shortcut)
-            blk.conv1x1_wv_f16 = f16(prefix + ".conv1x1.weight_v");
+        if (blk.has_shortcut) {
+            blk.conv1x1_wv_nhwc_f16 = nhwc16(prefix + ".conv1x1.weight_v");
+            blk.conv1x1_c_in_pad = pad_cin(prefix + ".conv1x1.weight_v");
+        }
         assign_adain1d_v2(blk.norm1, prefix + ".norm1");
         assign_adain1d_v2(blk.norm2, prefix + ".norm2");
     };

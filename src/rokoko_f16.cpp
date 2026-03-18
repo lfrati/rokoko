@@ -143,15 +143,7 @@ static void gemm_conv1d(const float* x, const __half* w, const float* bias,
                          int C_in_pad = 0) {
     int T_out = (T_in + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
 
-    if (K == 1 && stride == 1 && padding == 0 && dilation == 1) {
-        // K=1: just a GEMM (w is straight FP16, not NHWC)
-        sgemm_tn(C_out, T_out, C_in, w, C_in, x, C_in, y, C_out, stream);
-        if (residual) add_f32(y, residual, y, C_out * T_out, stream);
-        if (bias) channel_bias_add_f32(y, bias, C_out, T_out, stream);
-        return;
-    }
-
-    // K>1: Cutlass FP16 implicit GEMM conv (w is NHWC FP16)
+    // Cutlass FP16 implicit GEMM conv (w is NHWC FP16, works for all K)
     int actual_cin = C_in_pad ? C_in_pad : C_in;
     if (C_in_pad) {
         cast_f32_to_f16_pad(x, s_fp16_buf, T_in, C_in, C_in_pad, stream);
@@ -494,9 +486,9 @@ static void adain_resblk1d_forward(const float* x, const float* style,
     }
 
     if (blk.has_shortcut) {
-        gemm_conv1d(shortcut_buf, blk.conv1x1_wv_f16, nullptr, residual_buf,
+        gemm_conv1d(shortcut_buf, blk.conv1x1_wv_nhwc_f16, nullptr, residual_buf,
                      workspace, workspace_bytes, dim_in, dim_out, T_out, 1,
-                     1, 0, 1, stream);
+                     1, 0, 1, stream, nullptr, blk.conv1x1_c_in_pad);
         cudaMemcpyAsync(shortcut_buf, residual_buf, dim_out * T_out * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
     }
@@ -1067,10 +1059,11 @@ std::vector<float> rokoko_infer(const Weights& w,
                          22, C_out, har_frames, 12, 6, 3, 1, stream,
                          nullptr, w.gen_noise_convs[0].c_in_pad);
         } else {
-            gemm_conv1d(d_gen_har, w.gen_noise_convs[1].w_f16,
+            gemm_conv1d(d_gen_har, w.gen_noise_convs[1].w_nhwc_f16,
                          w.gen_noise_convs[1].b, d_gen_src,
                          d_dec_workspace, dec_ws_bytes,
-                         22, C_out, har_frames, 1, 1, 0, 1, stream);
+                         22, C_out, har_frames, 1, 1, 0, 1, stream,
+                         nullptr, w.gen_noise_convs[1].c_in_pad);
         }
 
         // noise_res[i]: uses slot2 (xt), slot3 (co) as temporaries
@@ -1200,3 +1193,9 @@ void precompute_weight_norms(Weights& w, cudaStream_t stream) {
     for (int i = 0; i < 6; i++) chk(w.gen_resblocks[i].convs1[0].wv_nhwc_f16);
     fprintf(stderr, "  FP16 binary: %d key pointers set, staging=64 MB\n", n_f16);
 }
+
+// FP16 binary: self-contained bundle with v2 weights + G2P + voices
+const char* default_bundle_url() {
+    return "https://github.com/lfrati/rokoko/releases/download/v1.0.0/rokoko.fp16.bundle";
+}
+const char* default_bundle_filename() { return "rokoko.fp16.bundle"; }

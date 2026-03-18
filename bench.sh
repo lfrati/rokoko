@@ -24,7 +24,7 @@ TEXTS=(
 )
 LABELS=("short" "medium" "long")
 
-cleanup() { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }
+cleanup() { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # Kill any leftover rokoko servers
