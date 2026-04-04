@@ -1,8 +1,10 @@
 rokoko
+rokoko.fp16
 *.wav
 *.o
 g2p_v8/
 voices/
 weights/
 scripts/
+bench.sh
 scratch/
