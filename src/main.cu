@@ -39,7 +39,7 @@ extern const char* default_weights_filename();
 extern size_t default_weights_size();
 
 // Release base URL — single source of truth for all downloads
-static const char* RELEASE_BASE = "https://github.com/LokalOptima/rokoko/releases/download/v2.0.0/";
+static const char* RELEASE_BASE = "https://github.com/LokalOptima/rokoko/releases/download/v2.0.1/";
 
 static const char* G2P_FILENAME = "g2p.bin";
 static const size_t G2P_SIZE = 34641552;
